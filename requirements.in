@@ -1,0 +1,35 @@
+# --- Core Framework ---
+fastapi
+uvicorn[standard]
+python-dateutil
+
+# --- Database & ORM ---
+sqlalchemy
+alembic
+psycopg2-binary
+geoalchemy2
+geoalchemy2[shapely]
+
+# --- MQTT ---
+paho-mqtt
+
+# --- Configuration ---
+pydantic-settings
+
+# --- Security ---
+PyJWT[crypto]
+
+# --- Map Generation ---
+staticmap3
+pillow
+geopy
+
+# --- Protomaps (for offline map generation) ---
+psutil
+aiohttp
+playwright
+
+# NOTE: pycryptodome was removed. Nothing under app/ ever imported it — no `from Crypto`
+# anywhere in the service. It is a compiled C extension, so carrying it meant a build
+# dependency and a CVE surface for code that never ran. Karto's only crypto is JWT
+# verification, which pyjwt[crypto] handles via cryptography. Do not add it back.

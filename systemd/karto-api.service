@@ -1,0 +1,36 @@
+[Unit]
+Description=Karto Trip Tracking Service API
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+# --- User and Group ---
+# It's recommended to run this service as a dedicated non-root user.
+# Replace 'karto' with the actual username you will use.
+# Example:
+# User=karto
+# Group=karto
+User=karto
+Group=karto
+
+# --- Paths ---
+# Set the working directory to the absolute path of your project.
+# Example: WorkingDirectory=/opt/karto
+WorkingDirectory=/path/to/your/karto/project
+
+# Set the path to the python executable within your project's virtual environment.
+# Example: ExecStart=/opt/karto/venv/bin/python run.py
+ExecStart=/path/to/your/karto/project/venv/bin/python run.py
+
+# --- Environment ---
+# Specifies the environment file to load for configuration.
+# Ensure this path is correct.
+EnvironmentFile=/path/to/your/karto/project/karto.env
+
+# --- Process Management ---
+# Automatically restart the service if it fails.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,37 @@
+[Unit]
+Description=Karto Map Generation Worker
+# This worker should start after the main API service is up.
+After=network.target karto-api.service
+Wants=karto-api.service
+
+[Service]
+# --- User and Group ---
+# It's recommended to run this service as the same user as the API.
+# Replace 'karto' with the actual username.
+# Example:
+# User=karto
+# Group=karto
+User=karto
+Group=karto
+
+# --- Paths ---
+# Set the working directory to the absolute path of your project.
+# Example: WorkingDirectory=/opt/karto
+WorkingDirectory=/path/to/your/karto/project
+
+# Set the path to the python executable within your project's virtual environment.
+# Example: ExecStart=/opt/karto/venv/bin/python map_worker.py
+ExecStart=/path/to/your/karto/project/venv/bin/python map_worker.py
+
+# --- Environment ---
+# The worker needs the same environment file as the API.
+# Ensure this path is correct.
+EnvironmentFile=/path/to/your/karto/project/karto.env
+
+# --- Process Management ---
+# Automatically restart the worker if it fails.
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

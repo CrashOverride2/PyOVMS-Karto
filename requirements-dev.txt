@@ -1,0 +1,29 @@
+# Development / CI-only dependencies. Not needed to run the service.
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   pytest
+
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# Static checks. Run: ruff check --select F,E9 app/
+ruff>=0.6
+
+# Regenerates requirements.txt from requirements.in. That file is generated output —
+# never edit it by hand.
+#
+#   Add or change a package (keeps every other pin where it is):
+#     uv pip compile requirements.in --universal --python-version 3.12 -o requirements.txt
+#
+#   Pull in security fixes (re-resolves everything to the newest allowed):
+#     uv pip compile requirements.in --universal --python-version 3.12 --upgrade -o requirements.txt
+#
+# --python-version 3.12 is the server's interpreter, and --universal keeps the result
+# valid on every platform rather than only the one that ran the compile. Same command as
+# the OVMS main server repository — see its requirements-dev.txt for the full reasoning.
+uv>=0.5
+
+# CVE scan of the pinned dependencies. Deselected from the default run because it needs
+# the online advisory database; run it with:
+#   pytest -m cve
+# See tests/test_dependency_cves.py.
+pip-audit>=2.7

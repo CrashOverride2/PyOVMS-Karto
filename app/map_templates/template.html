@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Karto Map Renderer</title>
+    <link rel="stylesheet" href="./leaflet.css" />
+    <style>
+        body, html { margin: 0; padding: 0; }
+        #map { width: 600px; height: 400px; background-color: #0d1117; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <script src="./leaflet.js"></script>
+    <script src="./pmtiles.js"></script>
+    <script src="./protomaps-leaflet.js"></script>
+
+    <script>
+        async function renderMap(tripGeoJsonUrl, pmtilesUrl) {
+            console.log("renderMap function started inside browser.");
+            try {
+                console.log(`Fetching data from URLs:`, { geojson: tripGeoJsonUrl, pmtiles: pmtilesUrl });
+                const tripResponse = await fetch(tripGeoJsonUrl);
+
+                if (!tripResponse.ok) throw new Error(`Failed to fetch GeoJSON. Status: ${tripResponse.status}`);
+                
+                const tripGeoJson = await tripResponse.json();
+                console.log("GeoJSON loaded successfully.");
+
+                const map = L.map('map', { zoomControl: false, attributionControl: false });
+
+                const paintRules = [
+                    { dataLayer: "water", symbolizer: new protomapsL.PolygonSymbolizer({ fill: "#1e3a8a" }) },
+                    { dataLayer: "landuse", symbolizer: new protomapsL.PolygonSymbolizer({ fill: "#161b22" }) },
+                    { dataLayer: "natural", symbolizer: new protomapsL.PolygonSymbolizer({ fill: "#161b22" }) },
+                    { dataLayer: "transit", symbolizer: new protomapsL.LineSymbolizer({ color: "#374151", width: 1 })},
+                    {
+                        dataLayer: "roads",
+                        symbolizer: new protomapsL.LineSymbolizer({
+                            color: (z,f) => (f.props.highway_kind === "highway" || f.props.highway_kind === "motorway") ? "#6b7280" : "#4b5563",
+                            width: (z,f) => (f.props.highway_kind === "highway" || f.props.highway_kind === "motorway") ? (z > 14 ? 3 : 2) : (z > 14 ? 2 : 1)
+                        })
+                    },
+                    { dataLayer: "buildings", symbolizer: new protomapsL.PolygonSymbolizer({ fill: "#22282f" }) },
+                    { dataLayer: "boundaries", symbolizer: new protomapsL.LineSymbolizer({ color: "#39FF14", width: 0.5, opacity: 0.4 }) }
+                ];
+
+                const labelRules = [
+                    {
+                        dataLayer: "places",
+                        symbolizer: new protomapsL.CenteredTextSymbolizer({
+                            label_props: ["name:en","name"],
+                            fill: (z,f) => (f.props.kind === 'country' || f.props.kind === 'region') ? '#FFF01F' : '#c9d1d9',
+                            stroke: "#0d1117",
+                            width: 2,
+                            font: (z,f) => {
+                                if (f.props.kind === 'country') return "bold 14px sans-serif";
+                                if (f.props.kind === 'region') return "bold 12px sans-serif";
+                                return "11px sans-serif";
+                            }
+                        })
+                    },
+                    {
+                        dataLayer: "roads",
+                        symbolizer: new protomapsL.LineLabelSymbolizer({
+                            label_props: ["name:en","name"],
+                            fill: "#8b949e",
+                            stroke: "#0d1117",
+                            width: 2,
+                            font: "10px sans-serif"
+                        })
+                    }
+                ];
+
+                const layer = protomapsL.leafletLayer({
+                    url: pmtilesUrl,
+                    paintRules: paintRules,
+                    labelRules: labelRules,
+                    backgroundColor: "#0d1117"
+                });
+                layer.addTo(map);
+
+                const tripLayer = L.geoJSON(tripGeoJson, {
+                    style: { color: '#39FF14', weight: 4, opacity: 0.8 }
+                }).addTo(map);
+
+                map.fitBounds(tripLayer.getBounds(), { padding: [50, 50] });
+                
+                const coords = tripGeoJson.geometry ? tripGeoJson.geometry.coordinates : tripGeoJson.coordinates;
+
+                if (coords && coords.length > 0) {
+                    const startCoord = coords[0];
+                    const endCoord = coords[coords.length - 1];
+                    
+                    const startPoint = [startCoord[1], startCoord[0]];
+                    const endPoint = [endCoord[1], endCoord[0]];
+                    
+                    L.circleMarker(startPoint, { radius: 6, color: 'black', fillColor: 'lime', fillOpacity: 1, weight: 1.5 }).addTo(map);
+                    L.circleMarker(endPoint, { radius: 6, color: 'black', fillColor: 'red', fillOpacity: 1, weight: 1.5 }).addTo(map);
+                }
+                console.log("Map layers added. Waiting for tiles to load...");
+
+                return new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        console.error('Map rendering timed out inside the browser.');
+                        reject(new Error('Map rendering timed out after 20 seconds.'));
+                    }, 20000);
+                    
+                    layer.once('load', () => {
+                        clearTimeout(timeout);
+                        console.log("Protomaps layer loaded. Buffering for final render...");
+                        setTimeout(() => {
+                            console.log("Map rendering complete.");
+                            resolve();
+                        }, 500);
+                    });
+                });
+            } catch (e) {
+                console.error("A critical error occurred during map rendering in browser:", e.message, e.stack);
+                throw e;
+            }
+        }
+    </script>
+</body>
+</html>

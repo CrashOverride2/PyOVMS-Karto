@@ -1,0 +1,82 @@
+# Ruff configuration.
+#
+# Kept deliberately in step with the OVMS main server's ruff.toml — same select list, same
+# permanent ignores, same reasoning. The two services share a database, a JWT format and a
+# maintainer; a rule that is right in one is right in the other, and differing lint rules
+# just make moving code between them annoying.
+#
+# The lint job in .forgejo/workflows/tests.yml runs `ruff check .` with no flags, so it
+# uses exactly this file. Everything selected below is clean as of this commit.
+
+target-version = "py312"   # matches requirements.txt and the CI workflows
+line-length = 120
+
+[lint]
+select = [
+    "F",      # pyflakes — undefined names, unused imports, shadowed definitions
+    "E4",     # import formatting
+    "E722",   # bare `except:` — also catches CancelledError and KeyboardInterrupt
+    "E9",     # syntax and IO errors
+    "ASYNC",  # blocking calls inside async functions
+    "B",      # bugbear — mutable defaults, loop-variable capture, silent except
+    "C4",     # redundant comprehensions and casts
+    "PIE",    # small dead constructs
+    "LOG",    # logging misuse
+    "DTZ",    # naive datetimes
+]
+
+ignore = [
+    # ---- Deliberate, permanent ----
+
+    # B008: the FastAPI idiom, `db: Session = Depends(get_db)`. See extend-immutable-calls.
+    "B008",
+
+    # E402: imports below code. alembic/env.py and map_worker.py both put the project root
+    # on sys.path before importing from it, which has to happen in that order.
+    "E402",
+
+    # ASYNC240: pathlib in an async function. Local stat/exists calls; the rule targets
+    # network filesystems.
+    "ASYNC240",
+
+    # ---- Not yet clean; each is its own piece of work ----
+
+    # B904: `raise ... from err`. Needs the right exception variable per site.
+    "B904",
+
+    # DTZ007: strptime without %z, parsing OVMS timestamps that the protocol defines as
+    # UTC. Fixing it means deciding where the timezone gets attached.
+    "DTZ007",
+]
+
+# Rule families still carrying findings, in the order worth tackling:
+#   UP  (133)  pep585/604 annotation syntax — mechanical, large diff
+#   G   (18)   f-strings in logging calls
+#   I   (16)   import sorting
+#   BLE (5)    blind `except Exception`
+
+[lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Form",
+    "fastapi.File",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.Security",
+]
+
+[lint.per-file-ignores]
+# Generated migrations; their shape is Alembic's business.
+"alembic/versions/*" = ["F", "E", "B", "C4", "PIE", "LOG", "DTZ"]
+
+# map_worker.py is a standalone process — systemd/karto-map-worker.service runs
+# `asyncio.run(main_worker_loop())` and it renders one map at a time. Its subprocess.Popen,
+# time.sleep(2) and blocking open() sit on a loop with nothing else to starve. In app/ the
+# same calls would stall every in-flight request, which is why ASYNC stays on there.
+"map_worker.py" = ["ASYNC220", "ASYNC230", "ASYNC251"]
+
+# Tests drive the same rendering path and build naive datetimes as fixtures on purpose.
+"tests/*" = ["ASYNC220", "ASYNC230", "ASYNC251", "DTZ001", "B017"]
