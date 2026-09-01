@@ -1,8 +1,10 @@
-from datetime import datetime, date
+from datetime import date
 from typing import List, Optional, Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field, computed_field
+
+from .timestamps import UtcDatetime
 class PaginationDetails(BaseModel):
     total_items: int
     total_pages: int
@@ -12,14 +14,15 @@ class TripSummary(BaseModel):
     id: UUID
     vehicle_id: str
     status: str
-    start_time: datetime
-    end_time: Optional[datetime] = None
+    start_time: UtcDatetime
+    end_time: Optional[UtcDatetime] = None
     duration_seconds: Optional[int] = None
     distance_km: Optional[float] = None
     soc_used: Optional[float] = None
     energy_used_kwh: Optional[float] = None
     average_speed_kph: Optional[float] = None
     map_preview_path: Optional[str] = None
+    map_preview_path_light: Optional[str] = None
     start_soc: Optional[float] = None
     end_soc: Optional[float] = None
 

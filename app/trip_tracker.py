@@ -12,6 +12,7 @@ from . import crud
 from .config import settings
 from . import database
 from .map_generator import generate_trip_map
+from .timestamps import as_utc
 
 logger = logging.getLogger(__name__)
 
@@ -332,10 +333,8 @@ class TripTrackerService:
             try:
                 # Handle both ISO format and 'YYYY-MM-DD HH:MM:SS UTC' format
                 cleaned_payload = payload.replace(' UTC', '').replace('Z', '+00:00')
-                dt_object = datetime.fromisoformat(cleaned_payload)
-                # Ensure timezone-aware datetime
-                if dt_object.tzinfo is None:
-                    dt_object = dt_object.replace(tzinfo=timezone.utc)
+                # A payload with no designator is UTC by protocol, not by local clock.
+                dt_object = as_utc(datetime.fromisoformat(cleaned_payload))
             except (ValueError, TypeError) as e:
                 logger.warning(f"Could not parse UTC time payload '{payload}' for {vehicle_id}: {e}")
                 return

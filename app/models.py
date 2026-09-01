@@ -23,6 +23,7 @@ class Trip(Base):
     distance_km = Column(Float)
     average_speed_kph = Column(Float)
     map_preview_path = Column(String(255))
+    map_preview_path_light = Column(String(255))
     start_location = Column(Geography('POINT', srid=4326))
     end_location = Column(Geography('POINT', srid=4326))
 

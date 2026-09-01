@@ -14,6 +14,7 @@ These tests start the real server against a throwaway directory layout and asser
 is and is not reachable.
 """
 
+import os
 import socket
 import subprocess
 import sys
@@ -29,6 +30,8 @@ SERVER_SCRIPT = REPO_ROOT / "app" / "render_server.py"
 
 TOKEN = "test-token-abcdef"
 
+STARTUP_TIMEOUT_SECONDS = 30
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -43,6 +46,13 @@ def _get(url: str):
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
+
+
+def _stderr(process: subprocess.Popen) -> str:
+    """Whatever the server managed to say before dying, for the failure message."""
+    if process.stderr is None:
+        return "<no stderr captured>"
+    return process.stderr.read().decode(errors="replace").strip() or "<no output>"
 
 
 @pytest.fixture(scope="module")
@@ -68,7 +78,7 @@ def render_server(tmp_path_factory):
 
     port = _free_port()
     env = {
-        "PATH": "/usr/bin:/bin",
+        **os.environ,
         "KARTO_RENDER_PORT": str(port),
         "KARTO_RENDER_TOKEN": TOKEN,
         "KARTO_RENDER_GEOJSON_DIR": str(geojson_dir),
@@ -81,7 +91,10 @@ def render_server(tmp_path_factory):
     )
     base = f"http://127.0.0.1:{port}"
 
-    for _ in range(50):
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            pytest.fail(f"render server exited with {process.returncode}: {_stderr(process)}")
         try:
             _get(f"{base}/{TOKEN}/template/template.html")
             break
@@ -89,7 +102,7 @@ def render_server(tmp_path_factory):
             time.sleep(0.1)
     else:
         process.kill()
-        pytest.fail(f"render server did not come up: {process.stderr.read().decode()}")
+        pytest.fail(f"render server did not come up: {_stderr(process)}")
 
     yield base, root
 

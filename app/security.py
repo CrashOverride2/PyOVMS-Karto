@@ -16,6 +16,7 @@ from .database import get_ovms_db
 from .exceptions import IPBannedException
 from .models_ovms import ApiKey
 from .models_ovms import User as OvmsUser
+from .timestamps import as_utc
 from .rate_limiter import ban_manager, failure_tracker
 
 logger = logging.getLogger(__name__)
@@ -33,14 +34,12 @@ def get_user_from_api_key(api_key_value: str, db: Session) -> Optional[OvmsUser]
 
     expires_at = db_api_key.expires_at
     if expires_at is not None:
-        # Only a naive value is UTC by convention. Overwriting the tzinfo of an aware
-        # one — which the shared PostgreSQL returns for timestamptz columns — shifts the
-        # deadline by the session's UTC offset, so a key is accepted for hours after it
-        # expired or rejected hours early. The OVMS server handles it the same way in
+        # as_utc, not replace(tzinfo=...): overwriting the tzinfo of an aware value —
+        # which PostgreSQL returns for timestamptz columns — shifts the deadline by the
+        # session's UTC offset, so a key is accepted for hours after it expired or
+        # rejected hours early. The OVMS server handles it the same way in
         # dependencies.get_user_from_api_key().
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if expires_at < datetime.now(timezone.utc):
+        if as_utc(expires_at) < datetime.now(timezone.utc):
             logger.warning(f"Rejected expired API key with prefix: {api_key_value[:8]}...")
             return None
 

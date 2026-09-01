@@ -19,7 +19,7 @@ from .security import get_current_user
 
 _MAP_FILENAME_RE = re.compile(
     r"[A-Z0-9-]{1,32}_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.png"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?:_light)?\.png"
 )
 from .models_ovms import User as OvmsUser
 
@@ -296,22 +296,18 @@ def delete_trip(
     current_user: OvmsUser = Depends(get_current_user)
 ):
     """
-    Deletes a trip, its associated GPS points, and its map preview image.
+    Deletes a trip, its associated GPS points, and both of its map preview images.
     Ensures the authenticated user has permission before deleting.
     """
     trip = _authorize_trip(db, ovms_db, trip_id, current_user.id)
-    
-    if trip.map_preview_path:
-        try:
-            map_file = Path(settings.MAPS_STORAGE_PATH) / Path(trip.map_preview_path).name
-            if map_file.is_file():
-                map_file.unlink()
-                logger.info(f"Deleted map preview file: {map_file}")
-        except Exception as e:
-            logger.error(f"Could not delete map file for trip {trip_id}: {e}")
+
+    preview_paths = (trip.map_preview_path, trip.map_preview_path_light)
 
     crud.delete_trip(db, trip_id=trip_id)
-    
+
+    for preview_path in preview_paths:
+        crud._remove_map_preview(preview_path)
+
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @router.get("/trips/{trip_id}/gpx", response_class=Response, tags=["Exports"], summary="Export trip as GPX")

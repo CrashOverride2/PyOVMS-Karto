@@ -18,7 +18,7 @@ import inspect
 
 import pytest
 
-from app import api
+from app import api, crud
 from app.config import Settings, settings
 
 
@@ -46,9 +46,27 @@ def test_docs_urls_are_gated_on_the_setting():
 @pytest.mark.parametrize("filename", [
     "ABC123_3f2504e0-4f89-11d3-9a0c-0305e82c3301.png",
     "EV-1_00000000-0000-0000-0000-000000000000.png",
+    # The light-themed twin of a preview.
+    "ABC123_3f2504e0-4f89-11d3-9a0c-0305e82c3301_light.png",
+    "EV-1_00000000-0000-0000-0000-000000000000_light.png",
 ])
 def test_valid_map_filenames_are_accepted(filename):
     assert api._MAP_FILENAME_RE.fullmatch(filename)
+
+
+def test_the_light_variant_is_still_resolved_through_the_database():
+    """
+    The `_light` suffix must not become a second way to address a file.
+
+    Widening the filename pattern is only safe as long as the trip is looked up by the
+    stored path; deriving it by stripping the suffix would put a client-controlled
+    string back into the authorization decision.
+    """
+    source = inspect.getsource(crud.get_trip_by_map_filename)
+    assert "map_preview_path_light" in source
+    assert "_light" not in source.replace("map_preview_path_light", ""), (
+        "the suffix must not be parsed off the filename"
+    )
 
 
 @pytest.mark.parametrize("filename", [

@@ -4,6 +4,7 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
 from .models import Trip
+from .timestamps import as_utc
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +33,8 @@ def generate_kml_for_trip(trip: Trip, points: List[Any]) -> str:
     SubElement(placemark, 'name').text = f"Trip for {trip.vehicle_id}"
     description_text = (
         f"Trip ID: {trip.id}\n"
-        f"Started: {trip.start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-        f"Ended: {trip.end_time.strftime('%Y-%m-%d %H:%M:%S UTC') if trip.end_time else 'N/A'}"
+        f"Started: {as_utc(trip.start_time).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        f"Ended: {as_utc(trip.end_time).strftime('%Y-%m-%d %H:%M:%S UTC') if trip.end_time else 'N/A'}"
     )
     SubElement(placemark, 'description').text = description_text
     SubElement(placemark, 'styleUrl').text = '#tripLineStyle'

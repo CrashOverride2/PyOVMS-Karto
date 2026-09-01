@@ -4,14 +4,21 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
 from .models import Trip
+from .timestamps import as_utc
 
 logger = logging.getLogger(__name__)
 
 def _to_iso_z(dt):
-    """Formats a datetime object to ISO 8601 with a 'Z' for Zulu/UTC."""
+    """Formats a datetime object to ISO 8601 with a 'Z' for Zulu/UTC.
+
+    Converts rather than assuming. `timestamptz` comes back in the session's TimeZone,
+    so on a PostgreSQL host set to anything but UTC this used to stamp a local wall
+    clock with a Z — a GPX file that says an instant it is not. A naive value is a
+    stored UTC timestamp whose label went missing and is taken as such.
+    """
     if not dt:
         return ""
-    return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+    return as_utc(dt).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 def generate_gpx_for_trip(trip: Trip, points: List[Any]) -> str:
     """

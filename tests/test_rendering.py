@@ -14,6 +14,7 @@ sys.path.insert(0, str(project_root))
 
 from app import crud, database
 from app.config import settings
+from map_worker import MAP_VARIANTS
 from playwright.async_api import async_playwright, Error as PlaywrightError
 
 logger = logging.getLogger(__name__)
@@ -115,28 +116,31 @@ async def test_playwright_map_rendering(db_session, local_http_server):
 
             await page.goto(page_url, wait_until="load", timeout=15000)
             
-            try:
-                logger.info("Calling renderMap in browser...")
-                await page.evaluate(
-                    """(params) => renderMap(params.tripGeoJsonUrl, params.pmtilesUrl)""",
-                    {
-                        "tripGeoJsonUrl": trip_geojson_url,
-                        "pmtilesUrl": pmtiles_url,
-                    }
-                )
-            except PlaywrightError as e:
-                pytest.fail(f"Map rendering script failed inside the browser. Error: {e}")
+            for theme, suffix in MAP_VARIANTS:
+                try:
+                    logger.info(f"Calling renderMap in browser ({theme})...")
+                    await page.evaluate(
+                        """(params) => renderMap(params.tripGeoJsonUrl, params.pmtilesUrl, params.theme)""",
+                        {
+                            "tripGeoJsonUrl": trip_geojson_url,
+                            "pmtilesUrl": pmtiles_url,
+                            "theme": theme,
+                        }
+                    )
+                except PlaywrightError as e:
+                    pytest.fail(f"Map rendering script failed inside the browser ({theme}). Error: {e}")
 
-            logger.info("Taking screenshot...")
-            map_element = await page.query_selector("#map")
-            assert map_element is not None, "Could not find #map element on the page."
-            screenshot_bytes = await map_element.screenshot(timeout=10000)
+                logger.info(f"Taking screenshot ({theme})...")
+                map_element = await page.query_selector("#map")
+                assert map_element is not None, "Could not find #map element on the page."
+                screenshot_bytes = await map_element.screenshot(timeout=10000)
 
-            output_path = output_dir / f"test_render_{trip_uuid}.png"
-            with open(output_path, "wb") as f:
-                f.write(screenshot_bytes)
-            
-            logger.info(f"✔✔✔ Successfully generated map! Output saved to: {output_path.resolve()} ✔✔✔")
+                output_path = output_dir / f"test_render_{trip_uuid}{suffix}.png"
+                with open(output_path, "wb") as f:
+                    f.write(screenshot_bytes)
+
+                logger.info(f"✔✔✔ Successfully generated {theme} map! Output saved to: {output_path.resolve()} ✔✔✔")
+
             await browser.close()
     finally:
         for temp_file in temp_files:

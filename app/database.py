@@ -13,6 +13,29 @@ ovms_engine: Optional[Engine] = None
 OvmsSessionLocal: Optional[sessionmaker] = None
 
 
+def connect_args_for(database_url: str) -> dict:
+    """DBAPI connect() arguments for a database URL.
+
+    PostgreSQL is pinned to UTC. `timestamptz` is returned *in the session's TimeZone*,
+    which defaults to whatever the server, the database or the role happens to be set to.
+    Karto reads instants and writes them back out as text — `_to_iso_z()` in the GPX
+    export and the "UTC" suffix in the KML description both format the value directly —
+    so a host configured for Europe/Berlin produced a Berlin wall clock labelled Z or
+    UTC. date_trunc() and extract('isodow') have the same exposure: they cut the
+    statistics on the session's day boundaries, not on UTC ones.
+
+    Both engines get it. The OVMS database is read-only here but supplies the timestamps
+    the ownership cutoffs compare against, and it need not be PostgreSQL at all — the
+    OVMS server defaults to SQLite — so the argument follows the URL rather than being
+    assumed.
+    """
+    if database_url.startswith("postgresql"):
+        return {"options": "-c timezone=UTC"}
+    if database_url.startswith("sqlite"):
+        return {"check_same_thread": False}
+    return {}
+
+
 def init_db_engines():
     """
     Creates both database engines and configures SessionLocals.
@@ -35,7 +58,7 @@ def init_db_engines():
     if engine is None:
         engine = create_engine(
             settings.DATABASE_URL,
-            connect_args={"connect_timeout": 10},
+            connect_args={"connect_timeout": 10, **connect_args_for(settings.DATABASE_URL)},
             **_POOL_KWARGS,
         )
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -43,6 +66,7 @@ def init_db_engines():
     if ovms_engine is None:
         ovms_engine = create_engine(
             settings.OVMS_DATABASE_URL,
+            connect_args=connect_args_for(settings.OVMS_DATABASE_URL),
             **_POOL_KWARGS,
         )
         OvmsSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=ovms_engine)

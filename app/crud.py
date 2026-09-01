@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 
 from . import models_ovms
+from .timestamps import as_utc
 from .config import settings
 from .models import GPSPoint, Trip, MapRegenerationQueue
 
@@ -176,8 +177,18 @@ def update_trip_on_completion(db: Session, trip: Trip, end_time: datetime, end_s
         logger.info(f"Completed trip {trip.id} for vehicle {trip.vehicle_id}. Distance: {trip.distance_km:.2f} km")
         return True
 
-def update_trip_map_path(db: Session, trip_id: UUID, path: str):
-    db.query(Trip).filter(Trip.id == trip_id).update({"map_preview_path": path})
+def update_trip_map_path(db: Session, trip_id: UUID, path: str, light_path: Optional[str] = None):
+    """
+    Record the rendered previews of a trip.
+
+    Both variants are written on every call, `light_path` included when it is None: the
+    staticmap3 renderer produces no light twin, and leaving a stale path behind would
+    point the client at an image that no longer matches the dark one next to it.
+    """
+    db.query(Trip).filter(Trip.id == trip_id).update({
+        "map_preview_path": path,
+        "map_preview_path_light": light_path,
+    })
     db.commit()
     logger.debug(f"Updated map path for trip {trip_id}")
 
@@ -192,7 +203,10 @@ def get_trip_by_map_filename(db: Session, filename: str) -> Optional[Trip]:
     whoever owned that would be authorized. Look the file up instead — the mapping is in
     our own table.
     """
-    return db.query(Trip).filter(Trip.map_preview_path == f"maps/{filename}").first()
+    stored = f"maps/{filename}"
+    return db.query(Trip).filter(
+        or_(Trip.map_preview_path == stored, Trip.map_preview_path_light == stored)
+    ).first()
 
 
 def get_trips_for_vehicle(
@@ -261,12 +275,17 @@ def delete_trip(db: Session, trip_id: UUID) -> bool:
     return False
 
 def get_map_paths_for_vehicle(db: Session, vehicle_id: str) -> List[str]:
-    """Retrieves all map_preview_path strings for a given vehicle."""
-    results = db.query(Trip.map_preview_path).filter(
+    """
+    Every rendered preview of a vehicle, dark and light variant alike.
+
+    Both have to be listed: this feeds the deletion path, and a light twin left on disk
+    after its trip is gone is still a picture of where the user drove.
+    """
+    results = db.query(Trip.map_preview_path, Trip.map_preview_path_light).filter(
         Trip.vehicle_id == vehicle_id,
-        Trip.map_preview_path.isnot(None)
+        or_(Trip.map_preview_path.isnot(None), Trip.map_preview_path_light.isnot(None))
     ).all()
-    return [row[0] for row in results]
+    return [path for row in results for path in row if path]
 
 def delete_all_trips_for_vehicle(db: Session, vehicle_id: str) -> int:
     """
@@ -277,7 +296,8 @@ def delete_all_trips_for_vehicle(db: Session, vehicle_id: str) -> int:
 
     * `map_regeneration_queue` has no foreign key to `trips`, so the bulk delete could
       not cascade into it and orphaned rows stayed queued forever.
-    * The rendered map previews on disk (`{vehicle}_{trip}.png`) were never touched.
+    * The rendered map previews on disk (`{vehicle}_{trip}.png` and its `_light` twin)
+      were never touched.
       Those images *are* the route — deleting the trip while leaving a picture of it
       on the filesystem is not a deletion.
 
@@ -287,7 +307,9 @@ def delete_all_trips_for_vehicle(db: Session, vehicle_id: str) -> int:
     Raises on failure rather than returning a count, so the caller can refuse to
     delete the vehicle when its data could not be removed.
     """
-    trips = db.query(Trip.id, Trip.map_preview_path).filter(Trip.vehicle_id == vehicle_id).all()
+    trips = db.query(
+        Trip.id, Trip.map_preview_path, Trip.map_preview_path_light
+    ).filter(Trip.vehicle_id == vehicle_id).all()
     if not trips:
         return 0
 
@@ -304,8 +326,9 @@ def delete_all_trips_for_vehicle(db: Session, vehicle_id: str) -> int:
     # Files last: the database is the record of what exists, so it is the part that
     # must be consistent. A file left behind after a successful commit is logged and
     # swept next time rather than rolling the deletion back.
-    for _, preview_path in trips:
+    for _, preview_path, light_preview_path in trips:
         _remove_map_preview(preview_path)
+        _remove_map_preview(light_preview_path)
 
     return len(trip_ids)
 
@@ -329,6 +352,19 @@ def _remove_map_preview(preview_path: Optional[str]) -> None:
             logger.info("Deleted map preview %s", target.name)
     except OSError as e:
         logger.warning("Could not delete map preview %r: %s", preview_path, e)
+
+def get_referenced_map_filenames(db: Session) -> set:
+    """
+    The bare file names of every preview the database still points at.
+
+    The orphan sweep compares the maps directory against this set, so a variant missing
+    here would be deleted while a trip is still showing it — both columns must be read.
+    """
+    rows = db.query(Trip.map_preview_path, Trip.map_preview_path_light).filter(
+        or_(Trip.map_preview_path.isnot(None), Trip.map_preview_path_light.isnot(None))
+    ).all()
+    return {Path(str(path)).name for row in rows for path in row if path}
+
 
 def get_completed_trip_covering(db: Session, vehicle_id: str, timestamp: datetime, slack_seconds: int) -> Optional[Trip]:
     """
@@ -683,7 +719,7 @@ def registration_cutoff(db: Session, vehicle_id: str) -> Optional[datetime]:
     created_at = getattr(vehicle, "created_at", None) if vehicle is not None else None
     if created_at is None:
         return None
-    return created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+    return as_utc(created_at)
 
 
 def trip_predates_registration(vehicle, trip) -> bool:
@@ -706,11 +742,7 @@ def trip_predates_registration(vehicle, trip) -> bool:
     started_at = getattr(trip, "start_time", None)
     if created_at is None or started_at is None:
         return False
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
-    if started_at.tzinfo is None:
-        started_at = started_at.replace(tzinfo=timezone.utc)
-    return started_at < created_at
+    return as_utc(started_at) < as_utc(created_at)
 
 def search_trips(
     db: Session,
@@ -734,13 +766,7 @@ def search_trips(
     owned_rows = ovms_db.query(
         models_ovms.Vehicle.vehicle_id, models_ovms.Vehicle.created_at
     ).filter(models_ovms.Vehicle.owner_id == user_id).all()
-    owned_cutoffs = {
-        row.vehicle_id: (
-            None if row.created_at is None
-            else (row.created_at if row.created_at.tzinfo else row.created_at.replace(tzinfo=timezone.utc))
-        )
-        for row in owned_rows
-    }
+    owned_cutoffs = {row.vehicle_id: as_utc(row.created_at) for row in owned_rows}
 
     if not owned_cutoffs:
         return [], 0

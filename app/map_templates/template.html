@@ -6,6 +6,8 @@
     <link rel="stylesheet" href="./leaflet.css" />
     <style>
         body, html { margin: 0; padding: 0; }
+        /* The background is set from the active theme in renderMap(); the value here
+           only covers the moment before the first render. */
         #map { width: 600px; height: 400px; background-color: #0d1117; }
     </style>
 </head>
@@ -17,87 +19,159 @@
     <script src="./protomaps-leaflet.js"></script>
 
     <script>
-        async function renderMap(tripGeoJsonUrl, pmtilesUrl) {
-            console.log("renderMap function started inside browser.");
+        const THEMES = {
+            dark: {
+                background:      "#0d1117",
+                water:           "#1e3a8a",
+                landuse:         "#161b22",
+                natural:         "#161b22",
+                transit:         "#374151",
+                roadMinor:       "#4b5563",
+                roadMajor:       "#6b7280",
+                buildings:       "#22282f",
+                boundaries:      "#39FF14",
+                boundaryOpacity: 0.4,
+                placeLabelMajor: "#FFF01F",
+                placeLabel:      "#c9d1d9",
+                roadLabel:       "#8b949e",
+                labelHalo:       "#0d1117",
+                track:           "#39FF14",
+                markerStart:     "lime",
+                markerEnd:       "red",
+                markerStroke:    "black"
+            },
+            light: {
+                background:      "#ffffff",
+                water:           "#c0e0ec",
+                landuse:         "#f2f2f2",
+                natural:         "#e0f0e0",
+                transit:         "#cccccc",
+                roadMinor:       "#c0c0c0",
+                roadMajor:       "#a0a0a0",
+                buildings:       "#d9d9d9",
+                boundaries:      "#888888",
+                boundaryOpacity: 0.6,
+                placeLabelMajor: "#222222",
+                placeLabel:      "#444444",
+                roadLabel:       "#555555",
+                labelHalo:       "#ffffff",
+                track:           "#0E7C3A",
+                markerStart:     "#15803d",
+                markerEnd:       "#b91c1c",
+                markerStroke:    "#ffffff"
+            }
+        };
+
+        function isMajorRoad(f) {
+            return f.props.highway_kind === "highway" || f.props.highway_kind === "motorway";
+        }
+
+        function buildPaintRules(t) {
+            return [
+                { dataLayer: "water",     symbolizer: new protomapsL.PolygonSymbolizer({ fill: t.water }) },
+                { dataLayer: "landuse",   symbolizer: new protomapsL.PolygonSymbolizer({ fill: t.landuse }) },
+                { dataLayer: "natural",   symbolizer: new protomapsL.PolygonSymbolizer({ fill: t.natural }) },
+                { dataLayer: "transit",   symbolizer: new protomapsL.LineSymbolizer({ color: t.transit, width: 1 }) },
+                {
+                    dataLayer: "roads",
+                    symbolizer: new protomapsL.LineSymbolizer({
+                        color: (z, f) => isMajorRoad(f) ? t.roadMajor : t.roadMinor,
+                        width: (z, f) => isMajorRoad(f) ? (z > 14 ? 3 : 2) : (z > 14 ? 2 : 1)
+                    })
+                },
+                { dataLayer: "buildings", symbolizer: new protomapsL.PolygonSymbolizer({ fill: t.buildings }) },
+                {
+                    dataLayer: "boundaries",
+                    symbolizer: new protomapsL.LineSymbolizer({
+                        color: t.boundaries, width: 0.5, opacity: t.boundaryOpacity
+                    })
+                }
+            ];
+        }
+
+        function buildLabelRules(t) {
+            return [
+                {
+                    dataLayer: "places",
+                    symbolizer: new protomapsL.CenteredTextSymbolizer({
+                        label_props: ["name:en", "name"],
+                        fill: (z, f) => (f.props.kind === 'country' || f.props.kind === 'region')
+                            ? t.placeLabelMajor : t.placeLabel,
+                        stroke: t.labelHalo,
+                        width: 2,
+                        font: (z, f) => {
+                            if (f.props.kind === 'country') return "bold 14px sans-serif";
+                            if (f.props.kind === 'region') return "bold 12px sans-serif";
+                            return "11px sans-serif";
+                        }
+                    })
+                },
+                {
+                    dataLayer: "roads",
+                    symbolizer: new protomapsL.LineLabelSymbolizer({
+                        label_props: ["name:en", "name"],
+                        fill: t.roadLabel,
+                        stroke: t.labelHalo,
+                        width: 2,
+                        font: "10px sans-serif"
+                    })
+                }
+            ];
+        }
+
+        let currentMap = null;
+        let cachedGeoJson = null;
+        let cachedGeoJsonUrl = null;
+
+        async function renderMap(tripGeoJsonUrl, pmtilesUrl, themeName) {
+            const theme = THEMES[themeName];
+            if (!theme) throw new Error(`Unknown map theme: ${themeName}`);
+            console.log(`renderMap function started inside browser (theme: ${themeName}).`);
             try {
-                console.log(`Fetching data from URLs:`, { geojson: tripGeoJsonUrl, pmtiles: pmtilesUrl });
-                const tripResponse = await fetch(tripGeoJsonUrl);
+                if (currentMap) {
+                    currentMap.remove();
+                    currentMap = null;
+                }
 
-                if (!tripResponse.ok) throw new Error(`Failed to fetch GeoJSON. Status: ${tripResponse.status}`);
-                
-                const tripGeoJson = await tripResponse.json();
-                console.log("GeoJSON loaded successfully.");
+                if (cachedGeoJsonUrl !== tripGeoJsonUrl) {
+                    console.log(`Fetching data from URLs:`, { geojson: tripGeoJsonUrl, pmtiles: pmtilesUrl });
+                    const tripResponse = await fetch(tripGeoJsonUrl);
+                    if (!tripResponse.ok) throw new Error(`Failed to fetch GeoJSON. Status: ${tripResponse.status}`);
+                    cachedGeoJson = await tripResponse.json();
+                    cachedGeoJsonUrl = tripGeoJsonUrl;
+                    console.log("GeoJSON loaded successfully.");
+                }
+                const tripGeoJson = cachedGeoJson;
 
+                document.getElementById('map').style.backgroundColor = theme.background;
                 const map = L.map('map', { zoomControl: false, attributionControl: false });
-
-                const paintRules = [
-                    { dataLayer: "water", symbolizer: new protomapsL.PolygonSymbolizer({ fill: "#1e3a8a" }) },
-                    { dataLayer: "landuse", symbolizer: new protomapsL.PolygonSymbolizer({ fill: "#161b22" }) },
-                    { dataLayer: "natural", symbolizer: new protomapsL.PolygonSymbolizer({ fill: "#161b22" }) },
-                    { dataLayer: "transit", symbolizer: new protomapsL.LineSymbolizer({ color: "#374151", width: 1 })},
-                    {
-                        dataLayer: "roads",
-                        symbolizer: new protomapsL.LineSymbolizer({
-                            color: (z,f) => (f.props.highway_kind === "highway" || f.props.highway_kind === "motorway") ? "#6b7280" : "#4b5563",
-                            width: (z,f) => (f.props.highway_kind === "highway" || f.props.highway_kind === "motorway") ? (z > 14 ? 3 : 2) : (z > 14 ? 2 : 1)
-                        })
-                    },
-                    { dataLayer: "buildings", symbolizer: new protomapsL.PolygonSymbolizer({ fill: "#22282f" }) },
-                    { dataLayer: "boundaries", symbolizer: new protomapsL.LineSymbolizer({ color: "#39FF14", width: 0.5, opacity: 0.4 }) }
-                ];
-
-                const labelRules = [
-                    {
-                        dataLayer: "places",
-                        symbolizer: new protomapsL.CenteredTextSymbolizer({
-                            label_props: ["name:en","name"],
-                            fill: (z,f) => (f.props.kind === 'country' || f.props.kind === 'region') ? '#FFF01F' : '#c9d1d9',
-                            stroke: "#0d1117",
-                            width: 2,
-                            font: (z,f) => {
-                                if (f.props.kind === 'country') return "bold 14px sans-serif";
-                                if (f.props.kind === 'region') return "bold 12px sans-serif";
-                                return "11px sans-serif";
-                            }
-                        })
-                    },
-                    {
-                        dataLayer: "roads",
-                        symbolizer: new protomapsL.LineLabelSymbolizer({
-                            label_props: ["name:en","name"],
-                            fill: "#8b949e",
-                            stroke: "#0d1117",
-                            width: 2,
-                            font: "10px sans-serif"
-                        })
-                    }
-                ];
+                currentMap = map;
 
                 const layer = protomapsL.leafletLayer({
                     url: pmtilesUrl,
-                    paintRules: paintRules,
-                    labelRules: labelRules,
-                    backgroundColor: "#0d1117"
+                    paintRules: buildPaintRules(theme),
+                    labelRules: buildLabelRules(theme),
+                    backgroundColor: theme.background
                 });
                 layer.addTo(map);
 
                 const tripLayer = L.geoJSON(tripGeoJson, {
-                    style: { color: '#39FF14', weight: 4, opacity: 0.8 }
+                    style: { color: theme.track, weight: 4, opacity: 0.8 }
                 }).addTo(map);
 
                 map.fitBounds(tripLayer.getBounds(), { padding: [50, 50] });
-                
+
                 const coords = tripGeoJson.geometry ? tripGeoJson.geometry.coordinates : tripGeoJson.coordinates;
 
                 if (coords && coords.length > 0) {
                     const startCoord = coords[0];
                     const endCoord = coords[coords.length - 1];
-                    
+
                     const startPoint = [startCoord[1], startCoord[0]];
                     const endPoint = [endCoord[1], endCoord[0]];
-                    
-                    L.circleMarker(startPoint, { radius: 6, color: 'black', fillColor: 'lime', fillOpacity: 1, weight: 1.5 }).addTo(map);
-                    L.circleMarker(endPoint, { radius: 6, color: 'black', fillColor: 'red', fillOpacity: 1, weight: 1.5 }).addTo(map);
+
+                    L.circleMarker(startPoint, { radius: 6, color: theme.markerStroke, fillColor: theme.markerStart, fillOpacity: 1, weight: 1.5 }).addTo(map);
+                    L.circleMarker(endPoint, { radius: 6, color: theme.markerStroke, fillColor: theme.markerEnd, fillOpacity: 1, weight: 1.5 }).addTo(map);
                 }
                 console.log("Map layers added. Waiting for tiles to load...");
 
@@ -106,7 +180,7 @@
                         console.error('Map rendering timed out inside the browser.');
                         reject(new Error('Map rendering timed out after 20 seconds.'));
                     }, 20000);
-                    
+
                     layer.once('load', () => {
                         clearTimeout(timeout);
                         console.log("Protomaps layer loaded. Buffering for final render...");

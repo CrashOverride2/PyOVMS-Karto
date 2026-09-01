@@ -175,6 +175,35 @@ def test_deletion_removes_the_rendered_map_previews():
     source = _code_only(crud.delete_all_trips_for_vehicle)
 
     assert "_remove_map_preview(" in source
+    # Both variants: a light twin left behind is just as much a picture of the route.
+    assert "map_preview_path_light" in source
+    assert source.count("_remove_map_preview(") == 2
+
+
+def test_single_trip_deletion_removes_both_preview_variants():
+    """
+    The same rule as the bulk delete, on the route that deletes one trip. This one kept
+    unlinking map_preview_path only after the light twin was added, so the second image
+    of the route survived the deletion.
+    """
+    source = _code_only(api.delete_trip)
+
+    assert "map_preview_path_light" in source
+    assert source.count("_remove_map_preview(") >= 1, (
+        "the route deletes by hand instead of using the helper that stays inside the "
+        "maps directory"
+    )
+
+
+def test_the_orphan_sweep_accounts_for_both_variants():
+    """
+    crud.get_referenced_map_filenames drives a deletion, so a variant it forgets is a
+    file the sweep would remove while a trip is still showing it.
+    """
+    source = _code_only(crud.get_referenced_map_filenames)
+
+    assert "map_preview_path" in source
+    assert "map_preview_path_light" in source
 
 
 def test_map_preview_removal_stays_inside_the_maps_directory():

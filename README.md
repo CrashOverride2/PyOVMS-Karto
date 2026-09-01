@@ -37,7 +37,7 @@ Karto has no user interface of its own — it sits behind the same reverse proxy
 
 ## Technology Stack
 
--   **Backend**: Python 3.12 and never
+-   **Backend**: Python 3.12 and newer
 -   **Framework**: FastAPI, Uvicorn
 -   **Database**: PostgreSQL with PostGIS extension (for geographic data).
 -   **ORM**: SQLAlchemy with GeoAlchemy2.
