@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Callable, Dict, NamedTuple, Optional, Coroutine
+from typing import Callable, Dict, NamedTuple, Optional, Coroutine, Tuple
 from uuid import UUID
 
 from geopy.distance import great_circle
@@ -25,6 +25,14 @@ class GpsLogPoint(NamedTuple):
     speed_kph: Optional[float] = None
     soc: Optional[float] = None
     altitude_m: Optional[float] = None
+    # Seconds since the position last changed, for formats that report it (XSQ-GPS-Log)
+    fix_age_s: Optional[float] = None
+
+
+# Upper bound for the record age taken from the topic. The modules buffer their records in
+# RAM and cap the queue (the NIU at 2000 records), so a larger value is a corrupt topic -
+# and an absurd one would not even survive the datetime arithmetic.
+_GPS_LOG_MAX_AGE_SECONDS = 7 * 86400
 
 
 def _opt_float(fields: list, index: int) -> Optional[float]:
@@ -68,14 +76,19 @@ def parse_xne_gps_log(payload: str) -> Optional[GpsLogPoint]:
     if speed is None:
         speed = _opt_float(fields, 5)
 
-    return GpsLogPoint(timestamp=ts, lat=lat, lon=lon, speed_kph=speed, soc=_opt_float(fields, 11))
+    # The module writes 0 while no battery is detected - that is no reading, and taken as one
+    # it would turn the trip's SoC usage into the whole charge
+    soc = _opt_float(fields, 11)
+    if soc is not None and soc <= 0:
+        soc = None
+
+    return GpsLogPoint(timestamp=ts, lat=lat, lon=lon, speed_kph=speed, soc=soc)
 
 
-def parse_rt_gps_log(payload: str) -> Optional[GpsLogPoint]:
+def _parse_untimed_gps_log(payload: str) -> Optional[GpsLogPoint]:
     """
-    Renault Twizy (vehicle type RT):
-      RT-GPS-Log,<odometer_mi/10>,<expiry>,<lat>,<lon>,<altitude_m>,<direction_deg>,
-                 <speed_kph>,<gpslock>,...
+    Shared layout of the GPS logs that follow the V2 history record convention:
+      <type>,<odometer>,<expiry>,<lat>,<lon>,<altitude_m>,<direction_deg>,<speed_kph>,<gpslock>,...
     Carries no timestamp of its own - the record age from the MQTT topic is used instead.
     """
     fields = payload.split(',')
@@ -95,12 +108,38 @@ def parse_rt_gps_log(payload: str) -> Optional[GpsLogPoint]:
                        speed_kph=_opt_float(fields, 7), altitude_m=_opt_float(fields, 5))
 
 
+def parse_rt_gps_log(payload: str) -> Optional[GpsLogPoint]:
+    """
+    Renault Twizy (vehicle type RT):
+      RT-GPS-Log,<odometer_mi/10>,<expiry>,<lat>,<lon>,<altitude_m>,<direction_deg>,
+                 <speed_kph>,<gpslock>,...
+    """
+    return _parse_untimed_gps_log(payload)
+
+
+def parse_xsq_gps_log(payload: str) -> Optional[GpsLogPoint]:
+    """
+    smart EQ fortwo/forfour 453 (vehicle type SQ):
+      XSQ-GPS-Log,<odometer_km/10>,<expiry>,<lat>,<lon>,<altitude_m>,<heading_deg>,
+                  <speed_kph>,<gpslock>,<latitude_age_s>,<net_sq>,<bat_power_kw>,
+                  <bat_energy_used_kwh>,<bat_energy_recd_kwh>,<bat_current_a>
+    Same layout as RT-GPS-Log up to the GPS lock. Only sent while the car is on.
+    latitude_age_s is the age of the latitude metric, i.e. how long ago the position last
+    changed - not the age of the fix itself, see _is_stale_log_fix().
+    """
+    point = _parse_untimed_gps_log(payload)
+    if point is None:
+        return None
+    return point._replace(fix_age_s=_opt_float(payload.split(','), 9))
+
+
 # Known GPS history record formats, keyed by the record type (first CSV field of the
 # payload). The delivery channel (notify/data/...) is generic OVMS framework, the record
 # layout is a convention of the individual vehicle module - add new vehicles here.
 GPS_LOG_PARSERS: Dict[str, Callable[[str], Optional[GpsLogPoint]]] = {
     'XNE-GPS-Log': parse_xne_gps_log,
     'RT-GPS-Log': parse_rt_gps_log,
+    'XSQ-GPS-Log': parse_xsq_gps_log,
 }
 class GPSPointInternal(BaseModel):
     timestamp: datetime
@@ -111,6 +150,26 @@ class GPSPointInternal(BaseModel):
 
     def to_wkt(self) -> str:
         return f'POINT({self.lon} {self.lat})'
+
+
+def _passes_point_filter(reference: GPSPointInternal, lat: float, lon: float,
+                         speed_kph: Optional[float]) -> bool:
+    """
+    The speed/distance filter shared by live points and GPS log records: a point is kept if
+    the vehicle is moving (KARTO_GPS_MIN_SPEED_KPH) or has moved away from the reference, the
+    last kept point (KARTO_GPS_MIN_DISTANCE_METERS). Below both it is noise from a vehicle
+    standing still - except for the first such point after a moving one. That one marks
+    where the vehicle came to a halt: at a traffic light, and above all at the destination,
+    which would otherwise end up to the distance threshold short of where it parked.
+    """
+    min_speed = settings.KARTO_GPS_MIN_SPEED_KPH
+    if (speed_kph or 0.0) >= min_speed:
+        return True
+    if (reference.speed_kph or 0.0) >= min_speed:
+        return True
+    distance = great_circle((reference.lat, reference.lon), (lat, lon)).meters
+    return distance >= settings.KARTO_GPS_MIN_DISTANCE_METERS
+
 class VehicleState(BaseModel):
     is_driving: bool = False
     last_driving_update: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -128,6 +187,12 @@ class VehicleState(BaseModel):
     pending_altitude_m: Optional[float] = None
     pending_gpstime: Optional[datetime] = None
 
+    # Last v.p.gpslock value, None until the module published one (not every vehicle does).
+    # Kept across bursts: OVMS only re-sends a metric when it changes.
+    gps_lock: Optional[bool] = None
+    # Position of the last burst that came without a GPS lock, see _flush_pending_gps_point()
+    last_unlocked_position: Optional[Tuple[float, float]] = None
+
     # Monotonic clock readings of when the position and the timestamp were received.
     # A point is only built from the two if they arrived in the same transmit burst.
     pending_pos_received: Optional[float] = None
@@ -139,6 +204,8 @@ class VehicleState(BaseModel):
 
     last_gps_update_time: Optional[datetime] = None
     last_gpslog_ts: Optional[datetime] = None
+    # Last GPS log point that passed the speed/distance filter, see _is_redundant_log_point()
+    last_gpslog_point: Optional[GPSPointInternal] = None
 class TripTrackerService:
     def __init__(self):
         self._vehicle_states: Dict[str, VehicleState] = {}
@@ -185,7 +252,8 @@ class TripTrackerService:
 
         return None
 
-    def process_data_notification(self, vehicle_id: str, payload: str, age_seconds: int = 0) -> Optional[Coroutine]:
+    def process_data_notification(self, vehicle_id: str, payload: str, age_seconds: int = 0,
+                                  received_at: Optional[datetime] = None) -> Optional[Coroutine]:
         """
         Entry point for OVMS data notifications (topic notify/data/...). These are history
         records the module buffered while its server connection was down and delivers after
@@ -193,7 +261,8 @@ class TripTrackerService:
         turned into GPS points with their historical time, closing the LTE gaps in the
         recorded route; other record types are ignored.
         `age_seconds` is the record age taken from the topic, used for formats that carry
-        no timestamp of their own.
+        no timestamp of their own. It counts from `received_at`, the moment the MQTT client
+        got the message - not from whenever a worker gets round to the record.
         """
         if not payload:
             return None
@@ -202,91 +271,157 @@ class TripTrackerService:
         if parser is None:
             logger.debug(f"Vehicle {vehicle_id}: ignoring data notification of unknown type '{record_type}'")
             return None
-        return self.handle_gps_log_record(vehicle_id, payload, parser, age_seconds)
+        return self.handle_gps_log_record(vehicle_id, payload, parser, age_seconds, received_at)
 
     async def handle_gps_log_record(self, vehicle_id: str, payload: str,
-                                    parser: Callable[[str], Optional[GpsLogPoint]], age_seconds: int):
+                                    parser: Callable[[str], Optional[GpsLogPoint]], age_seconds: int,
+                                    received_at: Optional[datetime] = None):
         point = parser(payload)
         if point is None:
             logger.warning(f"Vehicle {vehicle_id}: dropping unusable GPS log record: '{payload}'")
             return
 
-        # Formats without an own timestamp (e.g. RT-GPS-Log) get it from the record age
-        # the module publishes in the topic
+        # Formats without an own timestamp (RT-GPS-Log, XSQ-GPS-Log) get it from the record age
+        # the module publishes in the topic. Counted from the receive time: a reconnect burst
+        # can keep records waiting in the MQTT queue, which would otherwise shift each of them
+        # by however long it waited there.
         ts = point.timestamp
         if ts is None:
-            ts = datetime.now(timezone.utc) - timedelta(seconds=max(0, age_seconds))
-        lat, lon, speed_kph, soc = point.lat, point.lon, point.speed_kph, point.soc
-        wkt = f'POINT({lon} {lat})'
+            age = max(0, age_seconds)
+            if age > _GPS_LOG_MAX_AGE_SECONDS:
+                logger.warning(f"Vehicle {vehicle_id}: dropping GPS log record with implausible age {age_seconds}s: '{payload}'")
+                return
+            ts = (received_at or datetime.now(timezone.utc)) - timedelta(seconds=age)
 
         lock = await self._get_vehicle_lock(vehicle_id)
         async with lock:
             state = await self._get_or_create_state(vehicle_id)
 
             # Records are delivered in order (one at a time, acknowledged); skip replays
-            if state.last_gpslog_ts is not None and ts <= state.last_gpslog_ts:
+            previous_record_ts = state.last_gpslog_ts
+            if previous_record_ts is not None and ts <= previous_record_ts:
                 return
             state.last_gpslog_ts = ts
 
+            if self._is_stale_log_fix(point):
+                logger.debug(f"Vehicle {vehicle_id}: GPS log record at {ts.isoformat()} repeats a position "
+                             f"{point.fix_age_s:.0f}s old while moving, dropped.")
+                return
+            if self._is_redundant_log_point(state, previous_record_ts, ts, point):
+                return
+
             db = database.SessionLocal()
             try:
-                trip = None
-                if state.current_trip_id:
-                    trip = crud.get_trip_by_id(db, UUID(state.current_trip_id))
-                    if trip is None:
-                        logger.warning(f"Trip {state.current_trip_id} no longer exists. Clearing trip state for vehicle {vehicle_id}.")
-                        state.current_trip_id = None
-                        state.last_saved_gps_point = None
-                if trip is None:
-                    # e.g. after a Karto restart the in-memory state is gone but the trip is not
-                    trip = crud.get_in_progress_trip_by_vehicle(db, vehicle_id)
-
-                if trip is not None:
-                    self._insert_log_point_into_trip(db, trip, state, ts, point, wkt, vehicle_id)
-                    return
-
-                # No trip in progress: the record may belong to a trip that was already finalized
-                trip = crud.get_completed_trip_covering(db, vehicle_id, ts, settings.KARTO_GPSLOG_COMPLETED_ATTACH_SLACK_SECONDS)
-                if trip is not None:
-                    if crud.trip_has_point_near(db, trip.id, ts, settings.KARTO_GPSLOG_DEDUPE_SECONDS):
-                        return
-                    crud.add_gps_point(db, trip.id, ts, wkt, speed_kph, point.altitude_m)
-                    if soc is not None and trip.end_time and ts > trip.end_time:
-                        trip.end_soc = soc
-                    crud.refresh_trip_stats(db, trip)
-                    crud.enqueue_map_generation(db, trip.id)
-                    db.commit()
-                    logger.info(f"Vehicle {vehicle_id}: late GPS log point at {ts.isoformat()} attached to completed trip {trip.id}, map regeneration queued.")
-                    return
-
-                if state.is_driving:
-                    # Driving, but the live flow has no trip yet (e.g. the ride started inside
-                    # an LTE dead zone): start the trip from the buffered record
-                    new_trip = crud.create_trip(db, vehicle_id, ts, soc if soc is not None else state.latest_soc, wkt)
-                    db.flush()
-                    crud.add_gps_point(db, new_trip.id, ts, wkt, speed_kph, point.altitude_m)
-                    db.commit()
-                    state.current_trip_id = str(new_trip.id)
-                    state.trip_start_energy_kwh = state.latest_energy_kwh
-                    state.last_saved_gps_point = GPSPointInternal(lat=lat, lon=lon, speed_kph=speed_kph,
-                                                                 altitude_m=point.altitude_m, timestamp=ts)
-                    logger.info(f"TRIP STARTED: Vehicle {vehicle_id} started trip {new_trip.id} from a buffered GPS log record at {ts.isoformat()}.")
-                    return
-
-                logger.info(f"Vehicle {vehicle_id}: orphan GPS log record at {ts.isoformat()} (no matching trip), dropped.")
+                in_track = self._store_log_point(db, state, ts, point, vehicle_id)
             except Exception as e:
                 db.rollback()
+                in_track = False
                 logger.error(f"Failed to process GPS log record for {vehicle_id}: {e}", exc_info=True)
             finally:
                 db.close()
 
+            # Only a point that is part of a track may become the filter reference. One that
+            # was dropped (orphan, too old, database error) would otherwise suppress the
+            # standstill records after it, although none of them made it into a track either.
+            if in_track:
+                state.last_gpslog_point = GPSPointInternal(lat=point.lat, lon=point.lon, speed_kph=point.speed_kph,
+                                                           altitude_m=point.altitude_m, timestamp=ts)
+
+    def _store_log_point(self, db, state: VehicleState, ts: datetime, point: GpsLogPoint,
+                         vehicle_id: str) -> bool:
+        """
+        Puts a GPS log point into the trip it belongs to. Returns whether the track now has
+        a point at that time - stored here, or already there (de-duplication).
+        """
+        wkt = f'POINT({point.lon} {point.lat})'
+        soc = point.soc
+
+        trip = None
+        if state.current_trip_id:
+            trip = crud.get_trip_by_id(db, UUID(state.current_trip_id))
+            if trip is None:
+                logger.warning(f"Trip {state.current_trip_id} no longer exists. Clearing trip state for vehicle {vehicle_id}.")
+                state.current_trip_id = None
+                state.last_saved_gps_point = None
+        if trip is None:
+            # e.g. after a Karto restart the in-memory state is gone but the trip is not
+            trip = crud.get_in_progress_trip_by_vehicle(db, vehicle_id)
+
+        if trip is not None:
+            return self._insert_log_point_into_trip(db, trip, state, ts, point, wkt, vehicle_id)
+
+        # No trip in progress: the record may belong to a trip that was already finalized
+        trip = crud.get_completed_trip_covering(db, vehicle_id, ts, settings.KARTO_GPSLOG_COMPLETED_ATTACH_SLACK_SECONDS)
+        if trip is not None:
+            if crud.trip_has_point_near(db, trip.id, ts, settings.KARTO_GPSLOG_DEDUPE_SECONDS):
+                return True
+            crud.add_gps_point(db, trip.id, ts, wkt, point.speed_kph, point.altitude_m)
+            if soc is not None and trip.end_time and ts > trip.end_time:
+                trip.end_soc = soc
+            crud.refresh_trip_stats(db, trip)
+            crud.enqueue_map_generation(db, trip.id)
+            db.commit()
+            logger.info(f"Vehicle {vehicle_id}: late GPS log point at {ts.isoformat()} attached to completed trip {trip.id}, map regeneration queued.")
+            return True
+
+        if state.is_driving:
+            # Driving, but the live flow has no trip yet (e.g. the ride started inside
+            # an LTE dead zone): start the trip from the buffered record
+            new_trip = crud.create_trip(db, vehicle_id, ts, soc if soc is not None else state.latest_soc, wkt)
+            db.flush()
+            crud.add_gps_point(db, new_trip.id, ts, wkt, point.speed_kph, point.altitude_m)
+            db.commit()
+            state.current_trip_id = str(new_trip.id)
+            state.trip_start_energy_kwh = state.latest_energy_kwh
+            state.last_saved_gps_point = GPSPointInternal(lat=point.lat, lon=point.lon, speed_kph=point.speed_kph,
+                                                         altitude_m=point.altitude_m, timestamp=ts)
+            logger.info(f"TRIP STARTED: Vehicle {vehicle_id} started trip {new_trip.id} from a buffered GPS log record at {ts.isoformat()}.")
+            return True
+
+        logger.info(f"Vehicle {vehicle_id}: orphan GPS log record at {ts.isoformat()} (no matching trip), dropped.")
+        return False
+
+    @staticmethod
+    def _is_stale_log_fix(point: GpsLogPoint) -> bool:
+        """
+        XSQ-GPS-Log records carry how long ago the position last changed. While the vehicle
+        moves that is a second or two; much longer means the GPS lost its fix (tunnel,
+        garage) and the record repeats an old position under a new time. At a standstill a
+        large age is normal - the position simply does not change - so it only counts while
+        moving.
+        """
+        if point.fix_age_s is None:
+            return False
+        return ((point.speed_kph or 0.0) >= settings.KARTO_GPS_MIN_SPEED_KPH
+                and point.fix_age_s > settings.KARTO_GPSLOG_MAX_FIX_AGE_SECONDS)
+
+    @staticmethod
+    def _is_redundant_log_point(state: VehicleState, previous_record_ts: Optional[datetime],
+                                ts: datetime, point: GpsLogPoint) -> bool:
+        """
+        The speed/distance filter of the live flow (_passes_point_filter()), applied to GPS
+        log records. Some modules (e.g. the smart EQ) also send a record while standing still
+        whenever a battery value changes, which would otherwise pile up points at every
+        traffic light.
+        Because records arrive in order, the reference is simply the last record that made
+        it into a track, kept in memory - no database lookup. A pause in the record stream
+        means the vehicle was off in between, so the next record starts afresh instead of
+        being compared with where the previous ride ended.
+        """
+        reference = state.last_gpslog_point
+        if reference is None or previous_record_ts is None:
+            return False
+        if (ts - previous_record_ts).total_seconds() > settings.KARTO_GPSLOG_FILTER_RESET_SECONDS:
+            return False
+        return not _passes_point_filter(reference, point.lat, point.lon, point.speed_kph)
+
     def _insert_log_point_into_trip(self, db, trip, state: VehicleState, ts: datetime,
-                                    point: GpsLogPoint, wkt: str, vehicle_id: str):
+                                    point: GpsLogPoint, wkt: str, vehicle_id: str) -> bool:
         """Inserts a buffered GPS log point into an in-progress trip, backdating the trip
-        start if the ride began during the outage."""
+        start if the ride began during the outage. Returns whether the track has the point."""
         if ts >= trip.start_time:
             if crud.trip_has_point_near(db, trip.id, ts, settings.KARTO_GPSLOG_DEDUPE_SECONDS):
-                return
+                return True
             crud.add_gps_point(db, trip.id, ts, wkt, point.speed_kph, point.altitude_m)
             db.commit()
         elif (trip.start_time - ts).total_seconds() <= settings.KARTO_GPSLOG_BACKDATE_MAX_SECONDS:
@@ -300,13 +435,14 @@ class TripTrackerService:
             logger.info(f"Vehicle {vehicle_id}: trip {trip.id} start backdated to {ts.isoformat()} from a buffered GPS log record.")
         else:
             logger.info(f"Vehicle {vehicle_id}: GPS log record at {ts.isoformat()} predates trip {trip.id} start too far, dropped.")
-            return
+            return False
 
         # Keep the end-point candidate current so trip finalization uses the newest position
         if str(trip.id) == state.current_trip_id and \
                 (state.last_saved_gps_point is None or ts > state.last_saved_gps_point.timestamp):
             state.last_saved_gps_point = GPSPointInternal(lat=point.lat, lon=point.lon, speed_kph=point.speed_kph,
                                                           altitude_m=point.altitude_m, timestamp=ts)
+        return True
 
     async def handle_time_update(self, vehicle_id: str, payload: str):
         """
@@ -348,9 +484,18 @@ class TripTrackerService:
         async with lock:
             state = await self._get_or_create_state(vehicle_id)
             try:
-                state.latest_soc = float(payload)
+                soc = float(payload)
             except (ValueError, TypeError):
                 logger.warning(f"Could not parse SOC value '{payload}' for {vehicle_id}")
+                return
+            if soc <= 0:
+                # Some modules publish 0 for "no reading" - the NIU GT EVO whenever no battery
+                # is detected, e.g. once it has been taken out for charging, typically within
+                # the trip-end grace period. Keep the last real value rather than closing the
+                # trip at 0 %. A vehicle genuinely run down to 0 % ends at its last reading.
+                logger.debug(f"Vehicle {vehicle_id}: ignoring SOC {soc}, keeping {state.latest_soc}")
+                return
+            state.latest_soc = soc
 
     async def handle_energy_update(self, vehicle_id: str, payload: str):
         lock = await self._get_vehicle_lock(vehicle_id)
@@ -482,6 +627,14 @@ class TripTrackerService:
                     state.pending_pos_received = time.monotonic()
                 elif metric == 'v.p.speed': state.pending_speed_kph = float(payload)
                 elif metric == 'v.p.altitude': state.pending_altitude_m = float(payload)
+                elif metric == 'v.p.gpslock':
+                    state.gps_lock = payload.lower() in ['1', 'true', 'yes']
+                    if state.gps_lock:
+                        state.last_unlocked_position = None
+                    # The lock is read when the burst is flushed; it only has to extend a burst
+                    # that is already being collected, not start one of its own.
+                    if state.flush_deadline is None:
+                        return
                 else: return
             except (ValueError, TypeError) as e:
                 logger.warning(f"Could not parse payload '{payload}' for metric '{metric}': {e}")
@@ -567,6 +720,22 @@ class TripTrackerService:
             )
             return
 
+        # Without a GPS lock the module still publishes the last position it had. After an
+        # LTE outage that matters: the modem restarts, taking its GPS down with it, and the
+        # reconnect burst re-sends that old position with a fresh m.time.utc - a point back
+        # where the connection dropped, between the buffered log records of the outage.
+        # Not every position source reports its lock, though: the Jaguar I-Pace sets the
+        # position from its CAN bus while the modem GPS may have none. So an unlocked position
+        # only counts as stale while it stands still; once it moves, the source is live.
+        if state.gps_lock is False:
+            position = (state.pending_lat, state.pending_lon)
+            moved = state.last_unlocked_position is not None and position != state.last_unlocked_position
+            state.last_unlocked_position = position
+            if not moved:
+                logger.debug(f"Vehicle {vehicle_id}: discarding GPS point without GPS lock at a position that has not moved.")
+                state.pending_lat, state.pending_lon, state.pending_pos_received = None, None, None
+                return
+
         now = datetime.now(timezone.utc)
         if state.last_gps_update_time is not None:
             time_since_last_update = (now - state.last_gps_update_time).total_seconds()
@@ -601,14 +770,8 @@ class TripTrackerService:
             return
 
         if state.current_trip_id:
-            should_save = False
-            if not state.last_saved_gps_point:
-                should_save = True
-            else:
-                speed = current_gps_point.speed_kph or 0.0
-                distance = great_circle((state.last_saved_gps_point.lat, state.last_saved_gps_point.lon), (current_gps_point.lat, current_gps_point.lon)).meters
-                if speed >= settings.KARTO_GPS_MIN_SPEED_KPH or distance >= settings.KARTO_GPS_MIN_DISTANCE_METERS:
-                    should_save = True
+            should_save = state.last_saved_gps_point is None or _passes_point_filter(
+                state.last_saved_gps_point, current_gps_point.lat, current_gps_point.lon, current_gps_point.speed_kph)
 
             if should_save:
                 db = database.SessionLocal()

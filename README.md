@@ -14,7 +14,7 @@ Karto has no user interface of its own — it sits behind the same reverse proxy
     -   Filtering of insignificant GPS points to reduce data noise.
     -   Discarding of short, invalid trips (e.g., driving around a parking lot).
     -   Live GPS points are assembled from a whole MQTT transmit burst (debounced) instead of being committed on the first metric that arrives, so position and timestamp actually belong together.
--   **Recovery of Buffered GPS History**: OVMS modules buffer GPS points as data notifications (`notify/data/#`) during LTE outages and deliver them after reconnect. Karto subscribes with QoS 2 and a persistent session and folds late points into the in-progress trip, into a completed trip covering that time (recomputing statistics and re-rendering the map), or into a newly created trip. Known record formats are `XNE-GPS-Log` (NIU GT EVO) and `RT-GPS-Log` (Renault Twizy).
+-   **Recovery of Buffered GPS History**: OVMS modules buffer GPS points as data notifications (`notify/data/#`) during LTE outages and deliver them after reconnect. Karto subscribes with QoS 2 and a persistent session and folds late points into the in-progress trip, into a completed trip covering that time (recomputing statistics and re-rendering the map), or into a newly created trip. Known record formats are `XNE-GPS-Log` (NIU GT EVO), `RT-GPS-Log` (Renault Twizy) and `XSQ-GPS-Log` (smart EQ). The smart EQ only sends its log once the owner enables "GPS history log" in the vehicle's web settings. For the NIU, a "Route log interval" of 5–60 s is a good choice: records closer than `KARTO_GPSLOG_DEDUPE_SECONDS` (4 s) to an existing point are dropped anyway, and above `KARTO_GPSLOG_FILTER_RESET_SECONDS` (120 s) every record counts as the start of a new ride, which switches the standstill filter off.
 -   **Secure REST API**:
     -   Built with FastAPI.
     -   Authentication via session JWT cookie (verified with the main server's Ed25519 **public** key) or per-user API keys.
@@ -85,9 +85,9 @@ Other settings worth knowing (all optional, see `.env-template` for the full lis
 | `KARTO_TRIP_END_GRACE_PERIOD_SECONDS` | `120` | Wait after `v.e.on=0` before finalizing. |
 | `KARTO_TRIP_TIMEOUT_SECONDS` | `7200` | Inactivity before the reaper finalizes a trip. |
 | `KARTO_TRIP_MIN_DISTANCE_KM` | `1.0` | Shorter trips are discarded. |
-| `KARTO_GPS_MIN_SPEED_KPH` / `KARTO_GPS_MIN_DISTANCE_METERS` | `5.0` / `20.0` | Point filtering. |
+| `KARTO_GPS_MIN_SPEED_KPH` / `KARTO_GPS_MIN_DISTANCE_METERS` | `5.0` / `20.0` | Point filtering, for live metrics and GPS log records alike. |
 | `KARTO_GPS_BATCH_DEBOUNCE_SECONDS` / `KARTO_GPS_PAIR_MAX_SKEW_SECONDS` | `0.4` / `3.0` | Live point assembly from an MQTT burst. |
-| `KARTO_GPSLOG_*` | see `app/config.py` | Handling of buffered GPS log records (backdating, attach slack, de-duplication). |
+| `KARTO_GPSLOG_*` | see `app/config.py` | Handling of buffered GPS log records (backdating, attach slack, de-duplication, reset of the point filter after a pause, maximum position age while moving). |
 
 ### 3. Database Setup
 

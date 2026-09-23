@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
@@ -18,12 +19,13 @@ _METRIC_SUFFIXES = [
     "metric/v/p/longitude",
     "metric/v/p/speed",
     "metric/v/p/altitude",
+    "metric/v/p/gpslock",
     "metric/m/time/utc",
 ]
 
 # OVMS data notifications: history records the module buffered during an LTE outage,
 # published on notify/data/<subtype...>/<msg_id>/<-age_seconds>. The GPS log records in
-# there (XNE-GPS-Log, RT-GPS-Log, ...) are dispatched by their record type in the trip
+# there (XNE-GPS-Log, RT-GPS-Log, XSQ-GPS-Log, ...) are dispatched by their record type in the trip
 # tracker; other record types are ignored. Subscribed with QoS 2 so the broker queues
 # them for us across Karto restarts (requires the persistent session set up in connect()).
 _DATA_NOTIFY_SUFFIX = "notify/data/#"
@@ -223,7 +225,8 @@ class MqttSubscriber:
                     age_seconds = -int(parts[-1])
                 except ValueError:
                     age_seconds = 0
-                coro = trip_tracker_service.process_data_notification(vehicle_id, payload, age_seconds)
+                coro = trip_tracker_service.process_data_notification(
+                    vehicle_id, payload, age_seconds, received_at=datetime.now(timezone.utc))
             else:
                 logger.debug(f"Ignoring message on unexpected topic structure: {topic}")
                 return

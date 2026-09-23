@@ -39,7 +39,7 @@ def _captured_dispatches(monkeypatch, subscriber):
             seen.append(("metric", vehicle_id, metric_name))
             return None
 
-        def process_data_notification(self, vehicle_id, payload, age_seconds):
+        def process_data_notification(self, vehicle_id, payload, age_seconds, received_at=None):
             seen.append(("data", vehicle_id, age_seconds))
             return None
 

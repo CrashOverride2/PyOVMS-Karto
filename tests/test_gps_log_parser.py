@@ -17,7 +17,7 @@ os.environ.setdefault("OVMS_DATABASE_URL", "postgresql://localhost/karto_test")
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
-from app.trip_tracker import (GPS_LOG_PARSERS, parse_rt_gps_log, parse_xne_gps_log,
+from app.trip_tracker import (GPS_LOG_PARSERS, parse_rt_gps_log, parse_xne_gps_log, parse_xsq_gps_log,
                               trip_tracker_service)
 
 
@@ -38,6 +38,14 @@ def test_xne_parse_full_record():
     assert point.speed_kph == 45.0  # vehicle speed (field 9), not the GPS speed
     assert point.soc == 87.3
     assert point.altitude_m is None  # the NIU CAN bus carries no altitude
+
+
+def test_xne_parse_soc_zero_is_no_reading():
+    """The module writes 0 while no battery is detected."""
+    ts = _utc_now() - 60
+    point = parse_xne_gps_log(f"XNE-GPS-Log,{ts},86400,49.3,8.2,43.2,187,1.1,9,45.0,12345.6,0.0")
+    assert point is not None
+    assert point.soc is None
 
 
 def test_xne_parse_minimal_record_without_optional_fields():
@@ -105,11 +113,49 @@ def test_rt_parse_rejects_short_or_invalid_records():
     assert parse_rt_gps_log("RT-GPS-Log,123456,86400,0,0,42,265,38,1") is None
 
 
+# --- XSQ-GPS-Log (smart EQ) -------------------------------------------------
+
+def test_xsq_parse_full_record():
+    # Layout as written by OvmsVehicleSmartEQ::SendGPSLog()
+    payload = "XSQ-GPS-Log,123456,86400,49.321234,8.401234,112,87,52,1,0,-71,12.5,1.234,0.321,35.2"
+    point = parse_xsq_gps_log(payload)
+    assert point is not None
+    assert point.timestamp is None  # no time of its own, topic age is used instead
+    assert point.lat == 49.321234
+    assert point.lon == 8.401234
+    assert point.altitude_m == 112.0
+    assert point.speed_kph == 52.0
+    assert point.soc is None
+    assert point.fix_age_s == 0.0
+
+
+def test_xsq_parse_reads_the_position_age():
+    payload = "XSQ-GPS-Log,123456,86400,49.321234,8.401234,112,87,52,1,17,-71,12.5,1.234,0.321,35.2"
+    assert parse_xsq_gps_log(payload).fix_age_s == 17.0
+
+
+def test_rt_parse_has_no_position_age():
+    payload = "RT-GPS-Log,123456,86400,51.301234,6.501234,42,265,38,1,99,31"
+    assert parse_rt_gps_log(payload).fix_age_s is None
+
+
+def test_xsq_parse_rejects_record_without_gps_lock():
+    payload = "XSQ-GPS-Log,123456,86400,49.321234,8.401234,112,87,52,0,0,-71,12.5,1.234,0.321,35.2"
+    assert parse_xsq_gps_log(payload) is None
+
+
+def test_xsq_parse_rejects_short_or_invalid_records():
+    assert parse_xsq_gps_log("XSQ-GPS-Log,123456,86400,49.3,8.4") is None  # too short
+    assert parse_xsq_gps_log("XSQ-GPS-Log,123456,86400,49.3,181.0,112,87,52,1") is None
+    assert parse_xsq_gps_log("XSQ-GPS-Log,123456,86400,0.000000,0.000000,112,87,52,1") is None
+
+
 # --- Dispatcher --------------------------------------------------------------
 
-def test_dispatcher_knows_both_formats():
+def test_dispatcher_knows_all_formats():
     assert GPS_LOG_PARSERS["XNE-GPS-Log"] is parse_xne_gps_log
     assert GPS_LOG_PARSERS["RT-GPS-Log"] is parse_rt_gps_log
+    assert GPS_LOG_PARSERS["XSQ-GPS-Log"] is parse_xsq_gps_log
 
 
 def test_dispatcher_ignores_unknown_record_types():
