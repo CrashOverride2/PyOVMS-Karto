@@ -30,6 +30,9 @@ class Settings(BaseSettings):
 
     KARTO_TRIP_END_GRACE_PERIOD_SECONDS: int = 120
     KARTO_TRIP_TIMEOUT_SECONDS: int = 7200
+    # How long the last point of an open trip may lie back for a restarted Karto to
+    # continue that trip rather than finalize it and start a new one.
+    KARTO_TRIP_RESUME_MAX_GAP_SECONDS: int = 900
     
     KARTO_GPS_MIN_SPEED_KPH: float = 5.0
     KARTO_GPS_MIN_DISTANCE_METERS: float = 20.0

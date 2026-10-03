@@ -4,18 +4,20 @@ import re
 from pathlib import Path
 from typing import List, Literal, Optional
 from uuid import UUID
-from datetime import date
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from . import crud, gpx_generator, kml_generator
-from .api_models import (PaginatedTripSummary, PaginationDetails, TripDetail,
+from .api_models import (OpenTrip, PaginatedTripSummary, PaginationDetails, TripDetail,
                          TripStatistics, HeatmapPoint, PaginatedTripSearchSummary)
 from .config import settings
 from .database import get_db, get_ovms_db
 from .security import get_current_user
+from .timestamps import as_utc
+from .trip_tracker import trip_tracker_service
 
 _MAP_FILENAME_RE = re.compile(
     r"[A-Z0-9-]{1,32}_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -112,6 +114,71 @@ def get_trips_for_vehicle(
         trips=trips
     )
 
+@router.get(
+    "/vehicles/{vehicle_id}/trips/current",
+    response_model=OpenTrip,
+    responses={204: {"description": "The vehicle has no trip in progress."}},
+    summary="The trip in progress, if any",
+)
+def get_current_trip(
+    vehicle_id: str,
+    db: Session = Depends(get_db),
+    ovms_db: Session = Depends(get_ovms_db),
+    current_user: OvmsUser = Depends(get_current_user)
+):
+    """
+    The vehicle's trip in progress, as recorded so far — 204 when there is none.
+
+    The list of trips holds completed ones only, so this is the one way to learn the id
+    of a running trip; its track so far is `GET /trips/{id}`. A running trip can still
+    vanish rather than complete: one shorter than the minimum distance is discarded when
+    it ends, so a client polling the trip has to read a 404 as "ended and dropped".
+
+    A trip that has received nothing for `KARTO_TRIP_TIMEOUT_SECONDS` is not reported:
+    it is waiting to be finalized, not running.
+    """
+    vehicle_id_upper = vehicle_id.upper()
+    cutoff = _authorize_vehicle(
+        ovms_db, vehicle_id_upper, current_user.id, "access this vehicle's trips"
+    )
+
+    trip = crud.get_current_trip_for_vehicle(db, vehicle_id=vehicle_id_upper, cutoff=cutoff)
+    if trip is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    start_time = as_utc(trip.start_time)
+
+    last = crud.get_last_point_position(db, trip.id)
+    last_time = last[0] if last is not None else None
+    newest = last_time or start_time
+    if (datetime.now(timezone.utc) - newest).total_seconds() >= settings.KARTO_TRIP_TIMEOUT_SECONDS:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    distance_km = crud.track_length_km(db, trip.id)
+    duration = int((last_time - start_time).total_seconds()) if last_time is not None else 0
+    average = (distance_km / duration * 3600) if distance_km is not None and duration > 0 else None
+    start = crud.get_start_position(trip)
+    live = trip_tracker_service.live_view(vehicle_id_upper, str(trip.id))
+
+    return OpenTrip(
+        id=trip.id,
+        vehicle_id=trip.vehicle_id,
+        status=trip.status,
+        start_time=start_time,
+        start_soc=trip.start_soc,
+        start_lat=start[0] if start else None,
+        start_lon=start[1] if start else None,
+        last_point_time=last_time,
+        last_lat=last[1] if last else None,
+        last_lon=last[2] if last else None,
+        last_speed_kph=last[3] if last else None,
+        duration_seconds=max(duration, 0),
+        distance_km=round(distance_km, 3) if distance_km is not None else 0.0,
+        average_speed_kph=round(average, 1) if average is not None else None,
+        phase=live["phase"],
+        current_soc=live["current_soc"],
+        energy_used_kwh=round(live["energy_used_kwh"], 3) if live["energy_used_kwh"] is not None else None,
+    )
+
 @router.get("/vehicles/{vehicle_id}/stats", response_model=TripStatistics)
 def get_trip_statistics(
     vehicle_id: str,
@@ -151,14 +218,25 @@ def get_trip_statistics(
 @router.delete("/vehicles/{vehicle_id}/trips", status_code=status.HTTP_204_NO_CONTENT)
 def delete_all_trips_for_vehicle(
     vehicle_id: str,
+    include_in_progress: bool = Query(
+        False,
+        description="Also delete the trip still in progress. Only for deleting the vehicle "
+                    "itself: while it is tracked, the next point would start a new trip "
+                    "with the rest of the ride.",
+    ),
     db: Session = Depends(get_db),
     ovms_db: Session = Depends(get_ovms_db),
     current_user: OvmsUser = Depends(get_current_user)
 ):
     """
-    Deletes ALL trips, associated GPS points, and map previews for a vehicle.
+    Deletes all completed trips, their GPS points and map previews for a vehicle.
     This is an irreversible operation. Ensures the authenticated user has
     permission before deleting.
+
+    A trip still in progress is kept, as a single one cannot be deleted (409): the
+    tracker would start a new trip with the next point, and the deleted ride would
+    come back as its second half. It is listed once it has ended and can be deleted
+    then. `include_in_progress=true` deletes it as well — for deleting the vehicle.
     """
     vehicle_id_upper = vehicle_id.upper()
     if not crud.check_vehicle_ownership(ovms_db, user_id=current_user.id, vehicle_id=vehicle_id_upper):
@@ -176,7 +254,8 @@ def delete_all_trips_for_vehicle(
             except Exception as e:
                 logger.error(f"Could not delete map file {path} for vehicle {vehicle_id_upper}: {e}")
 
-    deleted_count = crud.delete_all_trips_for_vehicle(db, vehicle_id=vehicle_id_upper)
+    deleted_count = crud.delete_all_trips_for_vehicle(db, vehicle_id=vehicle_id_upper,
+                                                      include_in_progress=include_in_progress)
     logger.info(f"Deleted {deleted_count} trips for vehicle {vehicle_id_upper}.")
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -288,7 +367,18 @@ def get_trip_details(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trip not found")
     return trip
 
-@router.delete("/trips/{trip_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Trips"], summary="Delete a trip")
+_IN_PROGRESS_RESPONSE = {409: {"description": "The trip is still in progress."}}
+
+
+def _refuse_in_progress(trip, what: str) -> None:
+    """409 for an action that only makes sense on a trip that has ended."""
+    if trip.status == 'in_progress':
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Trip is still in progress and cannot be {what} yet")
+
+
+@router.delete("/trips/{trip_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Trips"], summary="Delete a trip",
+               responses=_IN_PROGRESS_RESPONSE)
 def delete_trip(
     trip_id: UUID,
     db: Session = Depends(get_db),
@@ -297,9 +387,14 @@ def delete_trip(
 ):
     """
     Deletes a trip, its associated GPS points, and both of its map preview images.
-    Ensures the authenticated user has permission before deleting.
+    Ensures the authenticated user has permission before deleting. 409 while the trip
+    is in progress.
     """
     trip = _authorize_trip(db, ovms_db, trip_id, current_user.id)
+    # The tracker is still writing to it, and would start a new trip with the next
+    # point — the ride split in two with its first half gone. It can be deleted once
+    # it has ended.
+    _refuse_in_progress(trip, "deleted")
 
     preview_paths = (trip.map_preview_path, trip.map_preview_path_light)
 
@@ -310,7 +405,8 @@ def delete_trip(
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-@router.get("/trips/{trip_id}/gpx", response_class=Response, tags=["Exports"], summary="Export trip as GPX")
+@router.get("/trips/{trip_id}/gpx", response_class=Response, tags=["Exports"], summary="Export trip as GPX",
+            responses=_IN_PROGRESS_RESPONSE)
 def get_trip_gpx(
     trip_id: UUID,
     db: Session = Depends(get_db),
@@ -318,9 +414,11 @@ def get_trip_gpx(
     current_user: OvmsUser = Depends(get_current_user)
 ):
     """
-    Exports the trip's track data as a GPX file.
+    Exports the trip's track data as a GPX file. 409 while the trip is in progress.
     """
     trip = _authorize_trip(db, ovms_db, trip_id, current_user.id)
+    # A file named after the trip would hold a fragment of it, and nothing in it says so.
+    _refuse_in_progress(trip, "exported")
     
     points = crud.get_trip_points_for_export(db, trip_id=trip_id)
     if not points:
@@ -336,7 +434,8 @@ def get_trip_gpx(
         }
     )
 
-@router.get("/trips/{trip_id}/kml", response_class=Response, tags=["Exports"], summary="Export trip as KML")
+@router.get("/trips/{trip_id}/kml", response_class=Response, tags=["Exports"], summary="Export trip as KML",
+            responses=_IN_PROGRESS_RESPONSE)
 def get_trip_kml(
     trip_id: UUID,
     db: Session = Depends(get_db),
@@ -344,9 +443,10 @@ def get_trip_kml(
     current_user: OvmsUser = Depends(get_current_user)
 ):
     """
-    Exports the trip's track data as a KML file.
+    Exports the trip's track data as a KML file. 409 while the trip is in progress.
     """
     trip = _authorize_trip(db, ovms_db, trip_id, current_user.id)
+    _refuse_in_progress(trip, "exported")
 
     points = crud.get_trip_points_for_export(db, trip_id=trip_id)
     if not points:

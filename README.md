@@ -84,6 +84,7 @@ Other settings worth knowing (all optional, see `.env-template` for the full lis
 | `MQTT_MAX_QUEUED_MESSAGES` / `MQTT_WORKER_COUNT` | `2000` / `4` | Bounded inbound work queue. |
 | `KARTO_TRIP_END_GRACE_PERIOD_SECONDS` | `120` | Wait after `v.e.on=0` before finalizing. |
 | `KARTO_TRIP_TIMEOUT_SECONDS` | `7200` | Inactivity before the reaper finalizes a trip. |
+| `KARTO_TRIP_RESUME_MAX_GAP_SECONDS` | `900` | Largest gap after which a restarted Karto still continues an open trip. |
 | `KARTO_TRIP_MIN_DISTANCE_KM` | `1.0` | Shorter trips are discarded. |
 | `KARTO_GPS_MIN_SPEED_KPH` / `KARTO_GPS_MIN_DISTANCE_METERS` | `5.0` / `20.0` | Point filtering, for live metrics and GPS log records alike. |
 | `KARTO_GPS_BATCH_DEBOUNCE_SECONDS` / `KARTO_GPS_PAIR_MAX_SKEW_SECONDS` | `0.4` / `3.0` | Live point assembly from an MQTT burst. |
@@ -201,6 +202,8 @@ alembic upgrade head
 alembic downgrade -1
 ```
 
+The API applies pending migrations itself on start, and refuses to start when one fails.
+
 ## Tools and Simulators
 
 ### `simulators/trip_simulator.py` / `simulators/trip_simulator_long.py`
@@ -242,7 +245,8 @@ All trip endpoints are prefixed with `/api/karto/v1`. Every one of them requires
 | Method   | Path                               | Description                                                          |
 | :------- | :--------------------------------- | :------------------------------------------------------------------- |
 | `GET`    | `/vehicles/{vehicle_id}/trips`     | Get a paginated list of trips for a vehicle.                         |
-| `DELETE` | `/vehicles/{vehicle_id}/trips`     | Delete **all** trips, points and map previews of a vehicle.          |
+| `GET`    | `/vehicles/{vehicle_id}/trips/current` | The trip in progress so far (start, newest point, distance), or 204. |
+| `DELETE` | `/vehicles/{vehicle_id}/trips`     | Delete all completed trips, points and map previews of a vehicle. The trip in progress is kept (deleting it would split the ride); `?include_in_progress=true` takes it too, for deleting the vehicle. |
 | `GET`    | `/vehicles/{vehicle_id}/stats`     | Total, daily, weekly, and monthly statistics (date range selectable). |
 | `GET`    | `/vehicles/{vehicle_id}/heatmap`   | Aggregated GPS point weights for heatmap rendering (`grid_size_m`).  |
 | `GET`    | `/trips/search`                    | Geographic search: proximity (`lat`/`lon`/`radius_m`) or `bbox`, matched against the trip's start or end via `relation`. |

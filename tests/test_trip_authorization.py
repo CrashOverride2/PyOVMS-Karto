@@ -163,7 +163,7 @@ def test_deletion_clears_the_map_regeneration_queue():
     assert "MapRegenerationQueue" in source
 
     queue = source.index("MapRegenerationQueue")
-    trips = source.index("db.query(Trip).filter(Trip.vehicle_id == vehicle_id).delete")
+    trips = source.index("db.query(Trip).filter(*selected).delete")
     assert queue < trips, "the queue is cleared after the trips it references are gone"
 
 
@@ -320,7 +320,7 @@ def test_authorize_vehicle_refuses_a_foreign_vehicle(monkeypatch):
 
 @pytest.mark.parametrize(
     "route",
-    ["get_trips_for_vehicle", "get_trip_statistics", "get_vehicle_heatmap"],
+    ["get_trips_for_vehicle", "get_trip_statistics", "get_vehicle_heatmap", "get_current_trip"],
 )
 def test_vehicle_scoped_routes_obtain_and_pass_the_cutoff(route):
     """
@@ -338,14 +338,15 @@ def test_vehicle_scoped_routes_obtain_and_pass_the_cutoff(route):
 
 
 @pytest.mark.parametrize(
-    "fn", [crud.get_trips_for_vehicle, crud.get_heatmap_for_vehicle, crud.get_trip_statistics]
+    "fn", [crud.get_trips_for_vehicle, crud.get_heatmap_for_vehicle, crud.get_trip_statistics,
+           crud.get_current_trip_for_vehicle]
 )
 def test_crud_accepts_a_cutoff(fn):
     assert "cutoff" in inspect.signature(fn).parameters
 
 
 @pytest.mark.parametrize(
-    "fn", [crud.get_trips_for_vehicle, crud.get_heatmap_for_vehicle]
+    "fn", [crud.get_trips_for_vehicle, crud.get_heatmap_for_vehicle, crud.get_current_trip_for_vehicle]
 )
 def test_crud_applies_the_cutoff_to_the_query(fn):
     source = _code_only(fn)

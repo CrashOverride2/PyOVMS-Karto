@@ -57,6 +57,10 @@ def db(monkeypatch):
 
     monkeypatch.setattr(trip_tracker.database, "SessionLocal", session_local)
     monkeypatch.setattr(trip_tracker.crud, "get_in_progress_trip_by_vehicle", lambda session, vid: fake.trip)
+    # The open trip moved just now, so every record is inside the resume gap and goes
+    # into it; the gap rule itself is pinned in test_trip_lifecycle.
+    monkeypatch.setattr(trip_tracker.crud, "get_last_point_position",
+                        lambda session, tid: (datetime.now(timezone.utc), 0.0, 0.0, None, None))
     monkeypatch.setattr(trip_tracker.crud, "get_completed_trip_covering", lambda *a, **kw: None)
     monkeypatch.setattr(trip_tracker.crud, "trip_has_point_near", lambda *a, **kw: False)
     monkeypatch.setattr(trip_tracker.crud, "add_gps_point", add_gps_point)

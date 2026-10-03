@@ -1,8 +1,8 @@
 from uuid import uuid4
 
 from geoalchemy2 import Geography
-from sqlalchemy import (BigInteger, Column, DateTime, Float, ForeignKey, Integer,
-                        String, Uuid, func)
+from sqlalchemy import (BigInteger, Column, DateTime, Float, ForeignKey, Index, Integer,
+                        String, Uuid, func, text)
 from sqlalchemy.orm import relationship
 
 from .database import Base
@@ -20,6 +20,9 @@ class Trip(Base):
     end_soc = Column(Float)
     soc_used = Column(Float)
     energy_used_kwh = Column(Float)
+    # Reading of v.b.energy.used when the trip started (or when it was first seen during
+    # it). Persisted so a trip resumed after a restart keeps its energy baseline.
+    start_energy_kwh = Column(Float)
     distance_km = Column(Float)
     average_speed_kph = Column(Float)
     map_preview_path = Column(String(255))
@@ -28,6 +31,15 @@ class Trip(Base):
     end_location = Column(Geography('POINT', srid=4326))
 
     gps_points = relationship("GPSPoint", back_populates="trip", cascade="all, delete-orphan", lazy="dynamic")
+
+    __table_args__ = (
+        Index('ix_trips_vehicle_status', 'vehicle_id', 'status'),
+        # At most one open trip per vehicle. The tracker keeps to that with a lock per
+        # vehicle, which only holds inside one process; the database holds it for all.
+        Index('uq_trips_vehicle_in_progress', 'vehicle_id', unique=True,
+              postgresql_where=text("status = 'in_progress'"),
+              sqlite_where=text("status = 'in_progress'")),
+    )
 
 
 class GPSPoint(Base):

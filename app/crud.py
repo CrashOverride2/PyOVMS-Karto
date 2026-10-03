@@ -6,11 +6,13 @@ from uuid import UUID
 
 from dateutil.relativedelta import relativedelta
 from geoalchemy2 import Geography, Geometry
+from geoalchemy2.elements import WKBElement, WKTElement
+from geoalchemy2.shape import to_shape
 from geoalchemy2.functions import (ST_AsGeoJSON, ST_DWithin, ST_MakeEnvelope,
                                    ST_Within, ST_Simplify, ST_GeogFromText)
 from sqlalchemy import and_, func, null, or_
 from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import aggregate_order_by, insert
 
 from . import models_ovms
 from .timestamps import as_utc
@@ -64,7 +66,26 @@ def count_pending_map_jobs(db: Session) -> int:
     return db.query(MapRegenerationQueue).filter(MapRegenerationQueue.status == 'pending').count()
 
 def get_in_progress_trip_by_vehicle(db: Session, vehicle_id: str) -> Optional[Trip]:
-    return db.query(Trip).filter(Trip.vehicle_id == vehicle_id, Trip.status == 'in_progress').first()
+    """
+    The newest open trip of a vehicle. Newest, not any: before trips were resumed after a
+    restart a vehicle could be left with two open rows, and `.first()` without an order
+    handed back whichever the database found first.
+    """
+    return db.query(Trip).filter(
+        Trip.vehicle_id == vehicle_id, Trip.status == 'in_progress'
+    ).order_by(Trip.start_time.desc()).first()
+
+def get_current_trip_for_vehicle(db: Session, vehicle_id: str,
+                                 cutoff: Optional[datetime] = None) -> Optional[Trip]:
+    """
+    The open trip the API reports as running — the newest one, and only if it is not
+    older than the vehicle's current registration (see registration_cutoff()).
+    """
+    query = db.query(Trip).filter(Trip.vehicle_id == vehicle_id, Trip.status == 'in_progress')
+    if cutoff is not None:
+        query = query.filter(Trip.start_time >= cutoff)
+    return query.order_by(Trip.start_time.desc()).first()
+
 
 class TripNotFound(Exception):
     """No trip with this id exists."""
@@ -112,7 +133,8 @@ def get_all_completed_trip_ids(db: Session) -> List[UUID]:
     results = db.query(Trip.id).filter(Trip.status == 'completed').all()
     return [result[0] for result in results]
 
-def create_trip(db: Session, vehicle_id: str, start_time: datetime, start_soc: Optional[float], start_point_wkt: str) -> Trip:
+def create_trip(db: Session, vehicle_id: str, start_time: datetime, start_soc: Optional[float], start_point_wkt: str,
+                start_energy_kwh: Optional[float] = None) -> Trip:
     """
     Creates a new Trip object using the provided start_time from the first GPS point.
     """
@@ -121,11 +143,31 @@ def create_trip(db: Session, vehicle_id: str, start_time: datetime, start_soc: O
         status='in_progress',
         start_time=start_time,
         start_soc=start_soc,
-        start_location=start_point_wkt
+        start_location=start_point_wkt,
+        start_energy_kwh=start_energy_kwh,
     )
     db.add(new_trip)
     logger.info(f"Created new trip object for vehicle {vehicle_id} (pending commit)")
     return new_trip
+
+def lock_open_trip(db: Session, trip_id: UUID) -> Optional[Trip]:
+    """
+    The trip, re-read and row-locked for the rest of the transaction — but only while it
+    is still `in_progress`. Finalization starts here, so a second finalizer (another
+    process, or one that loaded the row before the first committed) waits for the first
+    and then finds nothing to do, rather than completing the trip a second time.
+    `populate_existing()` because the session usually holds the row already, loaded
+    before the lock was taken.
+    """
+    return db.query(Trip).filter(
+        Trip.id == trip_id, Trip.status == 'in_progress'
+    ).with_for_update().populate_existing().first()
+
+def set_trip_start_energy(db: Session, trip_id: UUID, start_energy_kwh: float) -> None:
+    """Records the energy baseline of an open trip seen only after it started. The
+    caller commits."""
+    db.query(Trip).filter(Trip.id == trip_id, Trip.status == 'in_progress').update(
+        {"start_energy_kwh": start_energy_kwh}, synchronize_session=False)
 
 def update_trip_on_completion(db: Session, trip: Trip, end_time: datetime, end_soc: Optional[float], end_point: GPSPoint, energy_used_kwh: Optional[float] = None, battery_capacity_kwh: Optional[float] = None) -> bool:
     """
@@ -146,24 +188,13 @@ def update_trip_on_completion(db: Session, trip: Trip, end_time: datetime, end_s
     if trip.energy_used_kwh is None and battery_capacity_kwh is not None and trip.soc_used is not None and trip.soc_used > 0:
         trip.energy_used_kwh = round((trip.soc_used / 100.0) * battery_capacity_kwh, 3)
 
-    point_count = db.query(GPSPoint).filter(GPSPoint.trip_id == trip.id).count()
-    distance_km = 0.0
-    if point_count < 2:
+    distance_km = track_length_km(db, trip.id)
+    if distance_km is None:
         distance_km = 0.0
         trip.average_speed_kph = 0.0
-    else:
-        points_geom_subquery = db.query(
-            GPSPoint.location.cast(Geometry).label('location_geom')
-        ).filter(GPSPoint.trip_id == trip.id).order_by(GPSPoint.timestamp).subquery()
-        
-        line_geom = func.ST_MakeLine(points_geom_subquery.c.location_geom)
-        distance_meters = db.query(func.ST_Length(line_geom.cast(Geography))).scalar()
-        
-        if distance_meters is not None:
-            distance_km = distance_meters / 1000
-            if trip.duration_seconds and trip.duration_seconds > 0:
-                trip.average_speed_kph = (distance_km / trip.duration_seconds) * 3600
-    
+    elif trip.duration_seconds and trip.duration_seconds > 0:
+        trip.average_speed_kph = (distance_km / trip.duration_seconds) * 3600
+
     trip.distance_km = distance_km
     
     if trip.distance_km < settings.KARTO_TRIP_MIN_DISTANCE_KM:
@@ -235,16 +266,14 @@ def get_trip_with_points(db: Session, trip_id: UUID, simplify_tolerance: Optiona
         trip.geojson = None
         return trip
 
-    points_geom_subquery = db.query(
-        GPSPoint.location.cast(Geometry).label('location_geom')
-    ).filter(GPSPoint.trip_id == trip.id).order_by(GPSPoint.timestamp).subquery()
-
-    line_geom = func.ST_MakeLine(points_geom_subquery.c.location_geom)
+    # The order goes inside the aggregate, as in track_length_km(): an ORDER BY on a
+    # subquery feeding ST_MakeLine is not something SQL promises to keep.
+    line_geom = func.ST_MakeLine(aggregate_order_by(GPSPoint.location.cast(Geometry), GPSPoint.timestamp))
 
     if simplify_tolerance and simplify_tolerance > 0:
         line_geom = ST_Simplify(line_geom, simplify_tolerance)
-    
-    geojson_result = db.query(ST_AsGeoJSON(line_geom)).first()
+
+    geojson_result = db.query(ST_AsGeoJSON(line_geom)).filter(GPSPoint.trip_id == trip.id).first()
     
     if geojson_result and geojson_result[0]:
         trip.geojson = geojson_result[0]
@@ -287,9 +316,14 @@ def get_map_paths_for_vehicle(db: Session, vehicle_id: str) -> List[str]:
     ).all()
     return [path for row in results for path in row if path]
 
-def delete_all_trips_for_vehicle(db: Session, vehicle_id: str) -> int:
+def delete_all_trips_for_vehicle(db: Session, vehicle_id: str, include_in_progress: bool = False) -> int:
     """
     Delete every trace of a vehicle's trips and return how many trips were removed.
+
+    The running trip is left alone unless `include_in_progress` asks for it, for the
+    reason a single running trip cannot be deleted: the tracker starts a new trip with
+    the next point, and the ride the user deleted comes back as its second half. Only
+    deleting the vehicle itself has to take it too — nothing is left to track then.
 
     "Every trace" needs saying, because the previous version deleted only the `trips`
     rows and left two things behind:
@@ -307,9 +341,13 @@ def delete_all_trips_for_vehicle(db: Session, vehicle_id: str) -> int:
     Raises on failure rather than returning a count, so the caller can refuse to
     delete the vehicle when its data could not be removed.
     """
+    selected = [Trip.vehicle_id == vehicle_id]
+    if not include_in_progress:
+        selected.append(Trip.status != 'in_progress')
+
     trips = db.query(
         Trip.id, Trip.map_preview_path, Trip.map_preview_path_light
-    ).filter(Trip.vehicle_id == vehicle_id).all()
+    ).filter(*selected).all()
     if not trips:
         return 0
 
@@ -320,7 +358,7 @@ def delete_all_trips_for_vehicle(db: Session, vehicle_id: str) -> int:
         MapRegenerationQueue.trip_id.in_(trip_ids)
     ).delete(synchronize_session=False)
 
-    db.query(Trip).filter(Trip.vehicle_id == vehicle_id).delete(synchronize_session=False)
+    db.query(Trip).filter(*selected).delete(synchronize_session=False)
     db.commit()
 
     # Files last: the database is the record of what exists, so it is the part that
@@ -389,6 +427,62 @@ def trip_has_point_near(db: Session, trip_id: UUID, timestamp: datetime, toleran
         GPSPoint.timestamp <= timestamp + tol,
     ).first() is not None
 
+def track_length_km(db: Session, trip_id: UUID) -> Optional[float]:
+    """
+    Length of a trip's track as stored so far, its points joined in time order. None
+    while the track has fewer than two points. Shared by the completion, the late-point
+    refresh and the open-trip view, so all three measure the same line.
+
+    One query: the open-trip view runs this on every poll of every client following a
+    ride. The order goes inside the aggregate — an ORDER BY on a subquery feeding it is
+    not something SQL promises to keep.
+    """
+    line_geom = func.ST_MakeLine(aggregate_order_by(GPSPoint.location.cast(Geometry), GPSPoint.timestamp))
+    point_count, distance_meters = db.query(
+        func.count(GPSPoint.id), func.ST_Length(line_geom.cast(Geography))
+    ).filter(GPSPoint.trip_id == trip_id).one()
+    if point_count < 2 or distance_meters is None:
+        return None
+    return distance_meters / 1000
+
+
+def get_last_point_position(db: Session, trip_id: UUID) -> Optional[Tuple[datetime, float, float, Optional[float], Optional[float]]]:
+    """
+    `(timestamp, lat, lon, speed_kph, altitude_m)` of the chronologically last point of
+    a trip — the coordinates read out of the geography, which the ORM object only holds
+    as WKB. None for a trip without points.
+    """
+    row = db.query(
+        GPSPoint.timestamp,
+        func.ST_Y(GPSPoint.location.cast(Geometry)),
+        func.ST_X(GPSPoint.location.cast(Geometry)),
+        GPSPoint.speed_kph,
+        GPSPoint.altitude_m,
+    ).filter(GPSPoint.trip_id == trip_id).order_by(GPSPoint.timestamp.desc()).first()
+    if row is None:
+        return None
+    return as_utc(row[0]), float(row[1]), float(row[2]), row[3], row[4]
+
+
+def get_start_position(trip: Trip) -> Optional[Tuple[float, float]]:
+    """
+    `(lat, lon)` of a trip's start location, or None when it has none. Read out of the
+    loaded row rather than asked of the database a second time.
+    """
+    location = trip.start_location
+    if location is None:
+        return None
+    if isinstance(location, str):
+        # Assigned in this session and not yet reloaded: still the WKT it was given.
+        location = WKTElement(location)
+    if not isinstance(location, (WKBElement, WKTElement)):
+        return None
+    point = to_shape(location)
+    if point.is_empty:
+        return None
+    return float(point.y), float(point.x)
+
+
 def get_last_gps_point(db: Session, trip_id: UUID) -> Optional[GPSPoint]:
     """Returns the chronologically last stored point of a trip, if it has any."""
     return db.query(GPSPoint).filter(GPSPoint.trip_id == trip_id).order_by(GPSPoint.timestamp.desc()).first()
@@ -413,19 +507,11 @@ def refresh_trip_stats(db: Session, trip: Trip):
     if trip.start_soc is not None and trip.end_soc is not None:
         trip.soc_used = trip.start_soc - trip.end_soc
 
-    point_count = db.query(GPSPoint).filter(GPSPoint.trip_id == trip.id).count()
-    if point_count >= 2:
-        points_geom_subquery = db.query(
-            GPSPoint.location.cast(Geometry).label('location_geom')
-        ).filter(GPSPoint.trip_id == trip.id).order_by(GPSPoint.timestamp).subquery()
-
-        line_geom = func.ST_MakeLine(points_geom_subquery.c.location_geom)
-        distance_meters = db.query(func.ST_Length(line_geom.cast(Geography))).scalar()
-
-        if distance_meters is not None:
-            trip.distance_km = distance_meters / 1000
-            if trip.duration_seconds and trip.duration_seconds > 0:
-                trip.average_speed_kph = (trip.distance_km / trip.duration_seconds) * 3600
+    distance_km = track_length_km(db, trip.id)
+    if distance_km is not None:
+        trip.distance_km = distance_km
+        if trip.duration_seconds and trip.duration_seconds > 0:
+            trip.average_speed_kph = (trip.distance_km / trip.duration_seconds) * 3600
 
 def add_gps_point(db: Session, trip_id: UUID, timestamp: datetime, location_wkt: str, speed_kph: Optional[float], altitude_m: Optional[float]) -> GPSPoint:
     new_point = GPSPoint(
@@ -436,15 +522,22 @@ def add_gps_point(db: Session, trip_id: UUID, timestamp: datetime, location_wkt:
         altitude_m=altitude_m
     )
     db.add(new_point)
+    # Flushed at once: the sessions run with autoflush off, and the statistics read
+    # right after an insert (refresh_trip_stats(), the completion's track length, the
+    # last point) would otherwise measure the track without the point just added.
+    db.flush()
     return new_point
 
-def find_and_reap_timed_out_trips(db: Session, timeout_seconds: int) -> int:
+def find_timed_out_trips(db: Session, timeout_seconds: int) -> List[Trip]:
     """
-    Finds and DELETES 'in_progress' trips that have not received an update
-    within the specified timeout period.
+    The open trips that have not received a point within `timeout_seconds` — measured
+    from their newest point, or from the start for a trip without any. They are *found*
+    here, not deleted: the reaper hands them to the trip tracker, which finalizes them
+    like any other trip. Deleting them threw away every ride whose `v.e.on=0` was lost,
+    and every ride a Karto restart had left behind.
     """
     timeout_threshold = datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)
-    
+
     latest_gps_subquery = db.query(
         GPSPoint.trip_id,
         func.max(GPSPoint.timestamp).label('latest_timestamp')
@@ -459,22 +552,8 @@ def find_and_reap_timed_out_trips(db: Session, timeout_seconds: int) -> int:
         Trip.start_time < timeout_threshold,
         GPSPoint.id.is_(None)
     ).all()
-    
-    all_timed_out_trips = timed_out_trips_with_points + timed_out_trips_without_points
-    count = len(all_timed_out_trips)
 
-    if count == 0:
-        return 0
-
-    for trip in all_timed_out_trips:
-        logger.warning(
-            f"Reaping and DELETING timed-out trip {trip.id} for vehicle {trip.vehicle_id}."
-        )
-        db.delete(trip)
-
-    db.commit()
-    
-    return count
+    return timed_out_trips_with_points + timed_out_trips_without_points
 
 def _get_most_active_day(db: Session, vehicle_id: str, start_dt: Optional[datetime] = None, end_dt_exclusive: Optional[datetime] = None) -> Optional[str]:
     """Finds the most active day of the week within a given date range (inclusive start, exclusive end)."""

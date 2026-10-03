@@ -26,7 +26,13 @@ async def mqtt_subscription_refresh_task():
 
 
 async def run_migrations():
-    """Applies database migrations using Alembic."""
+    """
+    Applies database migrations using Alembic, and refuses to start without them. A
+    failed migration used to be logged and startup went on — against a schema the code
+    no longer matches: every query naming a column that migration would have added
+    (trips.start_energy_kwh is on every Trip load) fails, so the service came up looking
+    healthy and failed on every trip it touched. Better not to come up at all.
+    """
     logger.info("Attempting to apply database migrations...")
     try:
         alembic_cfg_path = Path(__file__).parent.parent / "alembic.ini"
@@ -42,7 +48,8 @@ async def run_migrations():
 
         logger.info("Database migrations applied successfully (or already up-to-date).")
     except Exception as e:
-        logger.error(f"Failed to apply database migrations: {e}", exc_info=True)
+        logger.critical(f"STARTUP ABORTED: failed to apply database migrations: {e}", exc_info=True)
+        raise
 
 
 @asynccontextmanager
@@ -76,6 +83,9 @@ async def lifespan(app):
     await mqtt_subscriber.stop_workers()
     # Debounced GPS points would otherwise still be built against a disposed engine.
     await trip_tracker_service.cancel_pending_flushes()
+    # Likewise the trip ends still in their grace period. Their trips stay open and are
+    # ended by the retained v.e.on=0 the next start receives.
+    await trip_tracker_service.cancel_pending_trip_ends()
 
     for task in background_tasks:
         task.cancel()

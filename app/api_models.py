@@ -1,5 +1,5 @@
 from datetime import date
-from typing import List, Optional, Any
+from typing import List, Literal, Optional, Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field, computed_field
@@ -61,6 +61,55 @@ class TripDetail(TripSummary):
 
     class Config:
         from_attributes = True
+class OpenTrip(BaseModel):
+    """
+    A trip that is still running: what has been recorded of it so far. Nothing here is
+    final — the trip may yet be discarded as too short when it ends.
+    """
+    id: UUID
+    vehicle_id: str
+    status: str = Field(..., description="Always `in_progress`.")
+    start_time: UtcDatetime
+    start_soc: Optional[float] = None
+    start_lat: Optional[float] = None
+    start_lon: Optional[float] = None
+    last_point_time: Optional[UtcDatetime] = Field(None, description="Time of the newest recorded point.")
+    last_lat: Optional[float] = None
+    last_lon: Optional[float] = None
+    last_speed_kph: Optional[float] = None
+    duration_seconds: Optional[int] = Field(None, description="From the start to the newest point.")
+    distance_km: Optional[float] = Field(None, description="Length of the track recorded so far.")
+    average_speed_kph: Optional[float] = None
+    phase: Optional[Literal["driving", "ending"]] = Field(
+        None,
+        description="`driving`, or `ending` while the vehicle is off and the trip waits out its end "
+                    "grace period. Null while the service has not picked the trip up since a restart.",
+    )
+    current_soc: Optional[float] = Field(None, description="The vehicle's SoC now, when known.")
+    energy_used_kwh: Optional[float] = Field(None, description="Energy used so far, when known.")
+
+    @computed_field
+    @property
+    def soc_used(self) -> Optional[float]:
+        if self.start_soc is not None and self.current_soc is not None:
+            return round(self.start_soc - self.current_soc, 1)
+        return None
+
+    @computed_field
+    @property
+    def distance_miles(self) -> Optional[float]:
+        if self.distance_km is not None:
+            return round(self.distance_km * 0.621371, 2)
+        return None
+
+    @computed_field
+    @property
+    def average_speed_mph(self) -> Optional[float]:
+        if self.average_speed_kph is not None:
+            return round(self.average_speed_kph * 0.621371, 1)
+        return None
+
+
 class PaginatedTripSummary(BaseModel):
     """
     A model to hold a list of trip summaries along with pagination metadata.

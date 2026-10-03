@@ -2,14 +2,15 @@ import asyncio
 import logging
 
 from . import database
-from .config import settings
-from . import crud
+from .trip_tracker import trip_tracker_service
 
 logger = logging.getLogger(__name__)
 
 async def trip_reaper_task():
     """
-    A background task that periodically checks for and "reaps" timed-out trips.
+    A background task that periodically finalizes timed-out trips — open trips that
+    stopped receiving points (KARTO_TRIP_TIMEOUT_SECONDS). They are finalized through the
+    trip tracker, not deleted: a trip whose `v.e.on=0` was lost is still a ride.
     """
     logger.info("Trip Reaper task started.")
     await asyncio.sleep(60) 
@@ -22,14 +23,10 @@ async def trip_reaper_task():
                 continue
 
             logger.debug("Running Trip Reaper check...")
-            db = database.SessionLocal()
-            try:
-                reaped_count = crud.find_and_reap_timed_out_trips(db, settings.KARTO_TRIP_TIMEOUT_SECONDS)
-                if reaped_count > 0:
-                    logger.debug(f"Reaped {reaped_count} timed-out trips.")
-            finally:
-                db.close()
-            
+            finalized = await trip_tracker_service.reap_timed_out_trips()
+            if finalized > 0:
+                logger.info(f"Trip Reaper: finalized {finalized} timed-out trip(s).")
+
             await asyncio.sleep(300)
 
         except asyncio.CancelledError:
