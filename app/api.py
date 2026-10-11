@@ -1,12 +1,12 @@
 import logging
 import math
 import re
-from pathlib import Path
 from typing import List, Literal, Optional
 from uuid import UUID
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -15,7 +15,7 @@ from .api_models import (OpenTrip, PaginatedTripSummary, PaginationDetails, Trip
                          TripStatistics, HeatmapPoint, PaginatedTripSearchSummary)
 from .config import settings
 from .database import get_db, get_ovms_db
-from .security import get_current_user
+from .security import current_api_key, get_current_user
 from .timestamps import as_utc
 from .trip_tracker import trip_tracker_service
 
@@ -53,6 +53,11 @@ def _authorize_vehicle(ovms_db: Session, vehicle_id: str, user_id: int, action: 
     return crud.registration_cutoff(ovms_db, vehicle_id)
 
 
+# Machine-readable `detail` of a trip that is not there for this user, so a client
+# can tell it from any other 404.
+TRIP_NOT_FOUND = "trip_not_found"
+
+
 def _authorize_trip(db: Session, ovms_db: Session, trip_id, user_id: int):
     """
     Resolve a trip on behalf of a user, or raise the right HTTP error.
@@ -68,9 +73,9 @@ def _authorize_trip(db: Session, ovms_db: Session, trip_id, user_id: int):
     try:
         return crud.resolve_owned_trip(db, ovms_db, trip_id, user_id)
     except crud.TripNotFound:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trip not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=TRIP_NOT_FOUND)
     except crud.TripNotAuthorized:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trip not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=TRIP_NOT_FOUND)
 
 
 @router.get("/vehicles/{vehicle_id}/trips", response_model=PaginatedTripSummary, summary="List trips for a vehicle")
@@ -216,7 +221,8 @@ def get_trip_statistics(
     )
 
 @router.delete("/vehicles/{vehicle_id}/trips", status_code=status.HTTP_204_NO_CONTENT)
-def delete_all_trips_for_vehicle(
+async def delete_all_trips_for_vehicle(
+    request: Request,
     vehicle_id: str,
     include_in_progress: bool = Query(
         False,
@@ -230,32 +236,39 @@ def delete_all_trips_for_vehicle(
 ):
     """
     Deletes all completed trips, their GPS points and map previews for a vehicle.
-    This is an irreversible operation. Ensures the authenticated user has
-    permission before deleting.
+    This is an irreversible operation. Allowed for the vehicle's owner, and for an
+    active admin using the main server's internal deletion key for this vehicle: the
+    main server calls this route when it deletes a vehicle or an account, with a
+    one-minute key of the acting user, who is often an admin. It is the only route
+    where an admin may act on another user's trips — none may read them.
 
     A trip still in progress is kept, as a single one cannot be deleted (409): the
     tracker would start a new trip with the next point, and the deleted ride would
     come back as its second half. It is listed once it has ended and can be deleted
-    then. `include_in_progress=true` deletes it as well — for deleting the vehicle.
+    then. `include_in_progress=true` deletes it as well — for deleting the vehicle —
+    and resets the tracker's memory of the vehicle in the same step.
     """
     vehicle_id_upper = vehicle_id.upper()
-    if not crud.check_vehicle_ownership(ovms_db, user_id=current_user.id, vehicle_id=vehicle_id_upper):
+    # Not _authorize_vehicle(): deletes the id's whole history, and admits an admin only
+    # with the main server's internal deletion key.
+    api_key = current_api_key(request)
+    authorized = await run_in_threadpool(
+        lambda: crud.check_vehicle_administration(ovms_db, user_id=current_user.id,
+                                                  vehicle_id=vehicle_id_upper, api_key=api_key)
+    )
+    if not authorized:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to delete this vehicle's trips")
 
-    map_paths_to_delete = crud.get_map_paths_for_vehicle(db, vehicle_id=vehicle_id_upper)
+    # The map previews are removed inside the crud call, after its commit.
+    def delete() -> int:
+        return crud.delete_all_trips_for_vehicle(db, vehicle_id=vehicle_id_upper,
+                                                 include_in_progress=include_in_progress)
 
-    for path in map_paths_to_delete:
-        if path:
-            try:
-                map_file = Path(settings.MAPS_STORAGE_PATH) / Path(path).name
-                if map_file.is_file():
-                    map_file.unlink()
-                    logger.info(f"Deleted map preview file: {map_file}")
-            except Exception as e:
-                logger.error(f"Could not delete map file {path} for vehicle {vehicle_id_upper}: {e}")
-
-    deleted_count = crud.delete_all_trips_for_vehicle(db, vehicle_id=vehicle_id_upper,
-                                                      include_in_progress=include_in_progress)
+    if include_in_progress:
+        # Under the vehicle's lock; see TripTrackerService.purge_vehicle().
+        deleted_count = await trip_tracker_service.purge_vehicle(vehicle_id_upper, delete)
+    else:
+        deleted_count = await run_in_threadpool(delete)
     logger.info(f"Deleted {deleted_count} trips for vehicle {vehicle_id_upper}.")
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -364,7 +377,7 @@ def get_trip_details(
     _authorize_trip(db, ovms_db, trip_id, current_user.id)
     trip = crud.get_trip_with_points(db, trip_id=trip_id, simplify_tolerance=simplify_tolerance)
     if not trip:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trip not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=TRIP_NOT_FOUND)
     return trip
 
 _IN_PROGRESS_RESPONSE = {409: {"description": "The trip is still in progress."}}

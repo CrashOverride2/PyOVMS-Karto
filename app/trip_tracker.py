@@ -252,6 +252,48 @@ class TripTrackerService:
         await self._get_or_create_state(vehicle_id)
         return self._vehicle_locks[vehicle_id]
 
+    async def purge_vehicle(self, vehicle_id: str, delete: Callable[[], Optional[int]]) -> Optional[int]:
+        """
+        Runs `delete` in a worker thread under the vehicle's lock and resets the in-memory
+        state in the same hold, so a racing point cannot open a new trip. Returns what
+        `delete` returns; None means nothing was deleted and memory is left alone.
+        """
+        lock = await self._get_vehicle_lock(vehicle_id)
+        async with lock:
+            result = await asyncio.to_thread(delete)
+            if result is not None:
+                self._forget_vehicle(vehicle_id)
+        return result
+
+    def _forget_vehicle(self, vehicle_id: str) -> None:
+        """Back to a fresh state: not driving, no trip, nothing pending. Lock held."""
+        for tasks in (self._flush_tasks, self._trip_end_tasks):
+            task = tasks.pop(vehicle_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+        # Replaced, never removed: other coroutines wait on the lock in _vehicle_locks.
+        self._vehicle_states[vehicle_id] = VehicleState()
+
+    def _may_open_trip(self, vehicle_id: str, state: VehicleState) -> bool:
+        """
+        Whether a new trip may be opened: the vehicle is registered on the OVMS server
+        with trip tracking on. Lock held. A failed lookup allows it.
+        """
+        try:
+            ovms_db = database.OvmsSessionLocal()
+            try:
+                allowed = crud.is_trip_tracking_enabled(ovms_db, vehicle_id)
+            finally:
+                ovms_db.close()
+        except Exception as e:
+            logger.warning(f"Vehicle {vehicle_id}: could not check the registration before opening a trip: {e}")
+            return True
+        if not allowed:
+            logger.info(f"Vehicle {vehicle_id}: not opening a trip, the vehicle is not registered "
+                        f"with trip tracking on (any more).")
+            state.is_driving = False
+        return allowed
+
     def process_message(self, vehicle_id: str, metric: str, payload: str) -> Optional[Coroutine]:
         if not payload:
             return None
@@ -387,7 +429,7 @@ class TripTrackerService:
             logger.info(f"Vehicle {vehicle_id}: late GPS log point at {ts.isoformat()} attached to completed trip {trip.id}, map regeneration queued.")
             return True
 
-        if state.is_driving:
+        if state.is_driving and self._may_open_trip(vehicle_id, state):
             # Driving, but the live flow has no trip yet (e.g. the ride started inside
             # an LTE dead zone): start the trip from the buffered record
             new_trip = self._create_trip_or_adopt(db, vehicle_id, state, ts,
@@ -1172,7 +1214,7 @@ class TripTrackerService:
                 # restart receives): nothing to add.
                 return
 
-        if state.is_driving and not state.current_trip_id:
+        if state.is_driving and not state.current_trip_id and self._may_open_trip(vehicle_id, state):
             logger.debug(f"Vehicle {vehicle_id}: First GPS point received while driving. Creating new trip.")
             db = database.SessionLocal()
             try:

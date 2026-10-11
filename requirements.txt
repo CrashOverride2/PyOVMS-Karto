@@ -63,7 +63,7 @@ markupsafe==3.0.3
     # via mako
 msgpack==1.2.1
     # via cachecontrol
-multidict==6.7.1
+multidict==6.9.1
     # via
     #   aiohttp
     #   yarl

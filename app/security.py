@@ -26,6 +26,12 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 def get_user_from_api_key(api_key_value: str, db: Session) -> Optional[OvmsUser]:
     """Validates an API key against the OVMS database."""
+    db_api_key = get_valid_api_key(api_key_value, db)
+    return db_api_key.user if db_api_key is not None else None
+
+
+def get_valid_api_key(api_key_value: str, db: Session) -> Optional[ApiKey]:
+    """The API key row, if the key is known, active, unexpired and has a user."""
     hashed_key = hashlib.sha256(api_key_value.encode("utf-8")).hexdigest()
     db_api_key = db.query(ApiKey).filter(ApiKey.hashed_key == hashed_key).first()
 
@@ -43,7 +49,7 @@ def get_user_from_api_key(api_key_value: str, db: Session) -> Optional[OvmsUser]
             logger.warning(f"Rejected expired API key with prefix: {api_key_value[:8]}...")
             return None
 
-    return db_api_key.user
+    return db_api_key
 
 
 def get_user_from_jwt(token: str, db: Session) -> Optional[OvmsUser]:
@@ -131,12 +137,17 @@ async def get_current_user(
     """
     user: Optional[OvmsUser] = None
     ip_address = request.client.host if request.client else "unknown"
+    # The key row the caller authenticated with, None for a session cookie.
+    request.state.api_key = None
 
     if ban_manager.is_banned(karto_db, ip_address):
         raise IPBannedException(ip_address)
 
     if api_key:
-        user = get_user_from_api_key(api_key, ovms_db)
+        db_api_key = get_valid_api_key(api_key, ovms_db)
+        if db_api_key is not None:
+            user = db_api_key.user
+            request.state.api_key = db_api_key
         if not user:
             failure_count = failure_tracker.record_failure_and_get_count(karto_db, ip_address)
             logger.debug(f"Invalid API key attempt from {ip_address}. Failure count: {failure_count}.")
@@ -189,3 +200,11 @@ async def get_current_user(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive")
 
     return user
+
+
+def current_api_key(request: Request) -> Optional[ApiKey]:
+    """
+    The API key row get_current_user() authenticated this request with, or None for a
+    session cookie. Only valid in a route that depends on get_current_user.
+    """
+    return getattr(request.state, "api_key", None)

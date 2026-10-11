@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 from datetime import datetime, timezone, timedelta, date
 from typing import List, Optional, Tuple
@@ -302,19 +303,6 @@ def delete_trip(db: Session, trip_id: UUID) -> bool:
         db.commit()
         return True
     return False
-
-def get_map_paths_for_vehicle(db: Session, vehicle_id: str) -> List[str]:
-    """
-    Every rendered preview of a vehicle, dark and light variant alike.
-
-    Both have to be listed: this feeds the deletion path, and a light twin left on disk
-    after its trip is gone is still a picture of where the user drove.
-    """
-    results = db.query(Trip.map_preview_path, Trip.map_preview_path_light).filter(
-        Trip.vehicle_id == vehicle_id,
-        or_(Trip.map_preview_path.isnot(None), Trip.map_preview_path_light.isnot(None))
-    ).all()
-    return [path for row in results for path in row if path]
 
 def delete_all_trips_for_vehicle(db: Session, vehicle_id: str, include_in_progress: bool = False) -> int:
     """
@@ -768,15 +756,76 @@ def get_vehicle_registration(db: Session, vehicle_id: str):
     return db.query(models_ovms.Vehicle).filter(models_ovms.Vehicle.vehicle_id == vehicle_id).first()
 
 
+def get_trip_vehicle_ids(db: Session) -> List[str]:
+    """Every vehicle id Karto holds at least one trip for."""
+    return [row[0] for row in db.query(Trip.vehicle_id).distinct().all()]
+
+
+# Bound parameters per IN (...): SQLite's limit is 999 on older builds.
+_REGISTRATION_LOOKUP_CHUNK = 500
+
+
+def get_registered_vehicle_ids(db: Session, vehicle_ids: List[str]) -> set[str]:
+    """The ids among `vehicle_ids` that are registered on the OVMS server, upper-cased."""
+    registered: set[str] = set()
+    wanted = sorted({vehicle_id.upper() for vehicle_id in vehicle_ids})
+    for start in range(0, len(wanted), _REGISTRATION_LOOKUP_CHUNK):
+        chunk = wanted[start:start + _REGISTRATION_LOOKUP_CHUNK]
+        rows = db.query(models_ovms.Vehicle.vehicle_id).filter(models_ovms.Vehicle.vehicle_id.in_(chunk)).all()
+        registered.update(row[0].upper() for row in rows)
+    return registered
+
+
+def count_registered_vehicles(db: Session) -> int:
+    return db.query(func.count(models_ovms.Vehicle.id)).scalar() or 0
+
+
 def check_vehicle_ownership(db: Session, user_id: int, vehicle_id: str) -> bool:
+    """
+    True only for the vehicle's owner: the rule for every read of trip data and for
+    deleting a single trip. No admin bypass; see check_vehicle_administration().
+    """
     vehicle = get_vehicle_registration(db, vehicle_id)
-    if vehicle:
-        if vehicle.owner_id == user_id:
-            return True
-        user = db.query(models_ovms.User).filter(models_ovms.User.id == user_id).first()
-        if user and user.is_admin:
-            return True
-    return False
+    return vehicle is not None and vehicle.owner_id == user_id
+
+
+def check_vehicle_administration(
+    db: Session, user_id: int, vehicle_id: str, api_key: Optional[models_ovms.ApiKey]
+) -> bool:
+    """
+    True for the vehicle's owner, or for an active admin authenticated with the main
+    server's internal deletion key for this vehicle. Used by `DELETE
+    /vehicles/{id}/trips` only; an admin's cookie or personal key is not enough.
+    """
+    vehicle = get_vehicle_registration(db, vehicle_id)
+    if vehicle is None:
+        return False
+    if vehicle.owner_id == user_id:
+        return True
+    if not is_internal_deletion_key(api_key, user_id=user_id, vehicle_id=vehicle_id):
+        return False
+    user = db.query(models_ovms.User).filter(models_ovms.User.id == user_id).first()
+    return bool(user is not None and user.is_admin and user.is_active)
+
+
+# Name the main server gives the key: f"temp-karto-delete-{vehicle_id}-{unix timestamp}".
+_INTERNAL_DELETION_KEY_RE = re.compile(r"temp-karto-delete-(?P<vehicle>.+)-\d+(?:\.\d+)?")
+# The server issues them for one minute. A longer lifetime is not one of them.
+INTERNAL_DELETION_KEY_MAX_LIFETIME = timedelta(minutes=5)
+
+
+def is_internal_deletion_key(
+    api_key: Optional[models_ovms.ApiKey], user_id: int, vehicle_id: str
+) -> bool:
+    """True for the main server's short-lived deletion key of this user and vehicle."""
+    if api_key is None or api_key.user_id != user_id:
+        return False
+    match = _INTERNAL_DELETION_KEY_RE.fullmatch(api_key.name or "")
+    if match is None or match.group("vehicle").upper() != vehicle_id.upper():
+        return False
+    if api_key.created_at is None or api_key.expires_at is None:
+        return False
+    return as_utc(api_key.expires_at) - as_utc(api_key.created_at) <= INTERNAL_DELETION_KEY_MAX_LIFETIME
 
 
 def registration_cutoff(db: Session, vehicle_id: str) -> Optional[datetime]:

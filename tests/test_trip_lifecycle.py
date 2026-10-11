@@ -831,13 +831,13 @@ def test_the_bulk_delete_route_keeps_the_running_trip_by_default(monkeypatch):
     from app import api
 
     calls = []
-    monkeypatch.setattr(api.crud, "check_vehicle_ownership", lambda ovms_db, user_id, vehicle_id: True)
-    monkeypatch.setattr(api.crud, "get_map_paths_for_vehicle", lambda db, vehicle_id: [])
+    monkeypatch.setattr(api.crud, "check_vehicle_administration", lambda ovms_db, user_id, vehicle_id, api_key: True)
     monkeypatch.setattr(api.crud, "delete_all_trips_for_vehicle",
                         lambda db, vehicle_id, include_in_progress: calls.append(include_in_progress) or 0)
 
-    api.delete_all_trips_for_vehicle("testcar", include_in_progress=True, db=None, ovms_db=None,
-                                     current_user=SimpleNamespace(id=1))
+    request = SimpleNamespace(state=SimpleNamespace(api_key=None))
+    asyncio.run(api.delete_all_trips_for_vehicle(request, "testcar", include_in_progress=True, db=None,
+                                                 ovms_db=None, current_user=SimpleNamespace(id=1)))
     assert calls == [True]
 
     # The default is what the app's "delete all trips" sends; the main server's /docs
@@ -995,3 +995,145 @@ def test_the_start_position_is_read_from_the_loaded_row():
                                                      srid=4326, extended=True))
     assert crud.get_start_position(trip) == pytest.approx((49.30, 8.40))
     assert crud.get_start_position(SimpleNamespace(start_location=None)) is None
+
+
+# ---------------------------------------------------------------------------
+# A vehicle deleted on the main server mid-ride leaves no trip behind
+# ---------------------------------------------------------------------------
+#
+# The main server deletes the trips first (include_in_progress=true), then the vehicle.
+# `is_driving` used to outlive both: the next point found its trip gone, cleared it and,
+# still "driving", opened a new one — under an id the main server was about to free, so
+# nobody owned it, saw it or deleted it.
+
+
+def _delete_all(store):
+    """What crud.delete_all_trips_for_vehicle(include_in_progress=True) does to the rows."""
+    def delete():
+        ids = [tid for tid, t in store.trips.items() if t.vehicle_id == VEHICLE]
+        for tid in ids:
+            del store.trips[tid]
+            store.points.pop(tid, None)
+        return len(ids)
+    return delete
+
+
+@pytest.mark.asyncio
+async def test_a_vehicle_purged_mid_ride_opens_no_new_trip(store):
+    """Inside the window before the main server deletes the row: still registered."""
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.e.on", "1")])
+    await drive_pass(tracker, T0, 49.30, 8.40)
+    assert len(store.trips) == 1
+
+    assert await tracker.purge_vehicle(VEHICLE, _delete_all(store)) == 1
+
+    await drive_pass(tracker, T0 + timedelta(seconds=30), 49.30 + 300 * M, 8.40)
+    assert store.trips == {}
+    state = tracker._vehicle_states[VEHICLE]
+    assert not state.is_driving and state.current_trip_id is None
+
+
+@pytest.mark.asyncio
+async def test_purging_cancels_the_pending_work_of_the_vehicle(store, monkeypatch):
+    monkeypatch.setattr(settings, "KARTO_TRIP_END_GRACE_PERIOD_SECONDS", 30)
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.e.on", "1")])
+    await drive_pass(tracker, T0, 49.30, 8.40)
+    await feed(tracker, [("v.e.on", "0")])
+    end_task = tracker._trip_end_tasks[VEHICLE]
+    lock = tracker._vehicle_locks[VEHICLE]
+
+    await tracker.purge_vehicle(VEHICLE, _delete_all(store))
+    await asyncio.sleep(0)
+
+    assert end_task.cancelled()
+    assert VEHICLE not in tracker._trip_end_tasks
+    assert tracker._vehicle_locks[VEHICLE] is lock, "a second lock would no longer serialize the vehicle"
+
+
+@pytest.mark.asyncio
+async def test_a_purge_that_deletes_nothing_leaves_memory_alone(store):
+    """None is the orphan sweep's 'registered again meanwhile' — that vehicle is tracked."""
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.e.on", "1")])
+    await drive_pass(tracker, T0, 49.30, 8.40)
+    trip_id = tracker._vehicle_states[VEHICLE].current_trip_id
+
+    assert await tracker.purge_vehicle(VEHICLE, lambda: None) is None
+    assert tracker._vehicle_states[VEHICLE].current_trip_id == trip_id
+
+
+@pytest.mark.asyncio
+async def test_no_trip_is_opened_for_a_vehicle_that_is_gone(store, monkeypatch):
+    """After the main server deleted the row, but before the subscription refresh."""
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.e.on", "1")])
+    await drive_pass(tracker, T0, 49.30, 8.40)
+    _delete_all(store)()
+    monkeypatch.setattr(trip_tracker.crud, "is_trip_tracking_enabled", lambda db, vid: False)
+
+    await drive_pass(tracker, T0 + timedelta(seconds=30), 49.30 + 300 * M, 8.40)
+    await drive_pass(tracker, T0 + timedelta(seconds=60), 49.30 + 600 * M, 8.40)
+
+    assert store.trips == {}
+    assert not tracker._vehicle_states[VEHICLE].is_driving
+
+
+@pytest.mark.asyncio
+async def test_no_trip_is_opened_from_a_log_record_of_a_vehicle_that_is_gone(store, monkeypatch):
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.e.on", "1")])
+    monkeypatch.setattr(trip_tracker.crud, "is_trip_tracking_enabled", lambda db, vid: False)
+
+    await feed_log(tracker, 10, xsq(49.30, 8.40, 40), received_at=datetime.now(timezone.utc))
+
+    assert store.trips == {}
+    assert not tracker._vehicle_states[VEHICLE].is_driving
+
+
+@pytest.mark.asyncio
+async def test_a_failed_registration_lookup_still_records_the_ride(store, monkeypatch):
+    def unreachable(db, vid):
+        raise RuntimeError("OVMS database gone")
+
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.e.on", "1")])
+    monkeypatch.setattr(trip_tracker.crud, "is_trip_tracking_enabled", unreachable)
+    await drive_pass(tracker, T0, 49.30, 8.40)
+
+    assert len(store.trips) == 1
+
+
+@pytest.mark.parametrize("include_in_progress, through_tracker", [(True, True), (False, False)])
+def test_only_the_vehicle_deletion_goes_through_the_tracker_lock(monkeypatch, include_in_progress, through_tracker):
+    """The app's 'delete all trips' keeps the running ride, so its memory stays too."""
+    from app import api
+
+    purged = []
+
+    async def purge(vehicle_id, delete):
+        purged.append(vehicle_id)
+        return delete()
+
+    monkeypatch.setattr(api.crud, "check_vehicle_administration", lambda ovms_db, user_id, vehicle_id, api_key: True)
+    monkeypatch.setattr(api.crud, "delete_all_trips_for_vehicle", lambda db, vehicle_id, include_in_progress: 0)
+    monkeypatch.setattr(api.trip_tracker_service, "purge_vehicle", purge)
+
+    request = SimpleNamespace(state=SimpleNamespace(api_key=None))
+    response = asyncio.run(api.delete_all_trips_for_vehicle(
+        request, "testcar", include_in_progress=include_in_progress, db=None, ovms_db=None,
+        current_user=SimpleNamespace(id=1)))
+
+    assert response.status_code == 204
+    assert purged == (["TESTCAR"] if through_tracker else [])
+
+
+def test_the_bulk_delete_route_leaves_the_map_files_to_the_crud_call():
+    """It unlinked them itself, before the rows: a failed delete kept trips without pictures."""
+    import inspect
+
+    from app import api
+
+    source = inspect.getsource(api.delete_all_trips_for_vehicle)
+    assert ".unlink(" not in source and "MAPS_STORAGE_PATH" not in source

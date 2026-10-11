@@ -14,6 +14,7 @@ the previous owner's complete movement profile.
 """
 
 import datetime
+import asyncio
 import inspect
 from types import SimpleNamespace
 
@@ -75,6 +76,23 @@ def test_unknown_and_foreign_trips_are_indistinguishable():
     assert "HTTP_403_FORBIDDEN" not in source, (
         "the resolver still distinguishes 'not found' from 'not yours'"
     )
+
+
+@pytest.mark.parametrize("raised", ["TripNotFound", "TripNotAuthorized"])
+def test_a_trip_not_there_is_answered_with_a_code(monkeypatch, raised):
+    """
+    The same machine-readable detail for both, so the app can tell this handler's 404
+    from an unrouted path or a proxy's and count a delete answered with it as done.
+    """
+    from fastapi import HTTPException
+
+    def resolve(*args, **kwargs):
+        raise getattr(crud, raised)()
+
+    monkeypatch.setattr(crud, "resolve_owned_trip", resolve)
+    with pytest.raises(HTTPException) as refused:
+        api._authorize_trip(None, None, "trip", 1)
+    assert (refused.value.status_code, refused.value.detail) == (404, "trip_not_found")
 
 
 # ---------------------------------------------------------------------------
@@ -391,3 +409,316 @@ def test_map_images_apply_the_registration_guard():
     guard = source.index("trip_predates_registration(")
     served = source.index("FileResponse(")
     assert guard < served, "the map is served before the age guard runs"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-09 — admins have no access to other users' trips
+# ---------------------------------------------------------------------------
+#
+# check_vehicle_ownership() let any admin through, so every admin could read every
+# vehicle's movement profile: list, running trip, detail, exports, statistics, heatmap,
+# map images. The main server's support mode (an owner grants an admin temporary access
+# to a vehicle) deliberately excludes trips. The one administrative path left is the bulk
+# delete, which the main server calls with the acting user's internal key when it deletes
+# a vehicle or an account — the actor is often an admin.
+#
+# These run against a real (SQLite) OVMS database, so the rule itself is exercised, not
+# a patched stand-in for it. Karto's own data layer is replaced by a sentinel: reaching
+# it means authorization let the caller through.
+
+from unittest.mock import MagicMock
+from uuid import UUID
+
+from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app import models_ovms
+
+OWNER, ADMIN, INACTIVE_ADMIN, STRANGER = 1, 2, 3, 4
+TRIP_ID = UUID("12345678-1234-1234-1234-123456789abc")
+REGISTERED = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+class _Reached(Exception):
+    """Karto's data layer was asked for the vehicle's trips."""
+
+
+def _reached(*args, **kwargs):
+    raise _Reached()
+
+
+@pytest.fixture
+def ovms_db():
+    # One connection for every thread: the bulk delete authorizes in the threadpool, and
+    # an in-memory database is otherwise a new, empty one per thread.
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    models_ovms.OvmsBase.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    for uid, name, is_admin, is_active in (
+        (OWNER, "owner", False, True),
+        (ADMIN, "admin", True, True),
+        (INACTIVE_ADMIN, "former-admin", True, False),
+        (STRANGER, "stranger", False, True),
+    ):
+        session.add(models_ovms.User(id=uid, username=name, hashed_password="x",
+                                     is_admin=is_admin, is_active=is_active))
+    session.add(models_ovms.Vehicle(vehicle_id="CAR1", owner_id=OWNER, created_at=REGISTERED))
+    session.commit()
+    yield session
+    session.close()
+    engine.dispose()
+
+
+def _user(uid):
+    return SimpleNamespace(id=uid)
+
+
+@pytest.mark.parametrize("uid, expected", [
+    (OWNER, True), (ADMIN, False), (INACTIVE_ADMIN, False), (STRANGER, False),
+])
+def test_ownership_is_the_owner_alone(ovms_db, uid, expected):
+    assert crud.check_vehicle_ownership(ovms_db, user_id=uid, vehicle_id="CAR1") is expected
+
+
+def _deletion_key(uid, vehicle_id="CAR1", lifetime=datetime.timedelta(minutes=1), name=None):
+    """The key the main server mints in trigger_karto_vehicle_deletion()."""
+    created = datetime.datetime.now(datetime.timezone.utc)
+    return models_ovms.ApiKey(
+        user_id=uid, hashed_key="h", is_active=True,
+        name=name if name is not None else f"temp-karto-delete-{vehicle_id}-{created.timestamp()}",
+        created_at=created, expires_at=created + lifetime if lifetime is not None else None,
+    )
+
+
+def _personal_key(uid):
+    return models_ovms.ApiKey(user_id=uid, hashed_key="h", is_active=True, name="my laptop",
+                              created_at=datetime.datetime.now(datetime.timezone.utc))
+
+
+@pytest.mark.parametrize("uid, key, expected", [
+    (OWNER, None, True),                      # the app's "delete all trips", by cookie
+    (OWNER, "personal", True),
+    (ADMIN, "deletion", True),                # the main server deleting vehicle/account
+    (ADMIN, None, False),                     # an admin's session cookie
+    (ADMIN, "personal", False),               # an admin's own API key
+    (INACTIVE_ADMIN, "deletion", False),
+    (STRANGER, "deletion", False),
+    (STRANGER, None, False),
+])
+def test_administration_is_the_owner_or_an_admin_with_the_deletion_key(ovms_db, uid, key, expected):
+    api_key = {"deletion": _deletion_key(uid), "personal": _personal_key(uid), None: None}[key]
+    assert crud.check_vehicle_administration(
+        ovms_db, user_id=uid, vehicle_id="CAR1", api_key=api_key) is expected
+
+
+@pytest.mark.parametrize("key", [
+    _deletion_key(ADMIN, vehicle_id="CAR2"),                           # another vehicle
+    _deletion_key(ADMIN, vehicle_id="CAR1-X"),                         # prefix of another id
+    _deletion_key(ADMIN, lifetime=datetime.timedelta(days=30)),        # not short-lived
+    _deletion_key(ADMIN, lifetime=None),                               # never expires
+    _deletion_key(ADMIN, name="temp-karto-delete-CAR1"),               # no timestamp
+    _deletion_key(OWNER),                                              # someone else's key
+], ids=["other-vehicle", "id-prefix", "long-lived", "no-expiry", "no-timestamp", "other-user"])
+def test_admin_needs_this_vehicles_short_lived_deletion_key(ovms_db, key):
+    assert crud.check_vehicle_administration(
+        ovms_db, user_id=ADMIN, vehicle_id="CAR1", api_key=key) is False
+
+
+def test_deletion_key_matches_the_vehicle_id_case_insensitively(ovms_db):
+    assert crud.check_vehicle_administration(
+        ovms_db, user_id=ADMIN, vehicle_id="CAR1", api_key=_deletion_key(ADMIN, vehicle_id="car1")) is True
+
+
+def test_no_one_holds_an_unknown_vehicle(ovms_db):
+    assert crud.check_vehicle_ownership(ovms_db, user_id=ADMIN, vehicle_id="NOPE") is False
+    assert crud.check_vehicle_administration(
+        ovms_db, user_id=ADMIN, vehicle_id="NOPE", api_key=_deletion_key(ADMIN, vehicle_id="NOPE")) is False
+
+
+_VEHICLE_ROUTES = {
+    "list": ("get_trips_for_vehicle", "get_trips_for_vehicle", dict(page=1, limit=5)),
+    "current": ("get_current_trip", "get_current_trip_for_vehicle", {}),
+    "stats": ("get_trip_statistics", "get_trip_statistics",
+              dict(start_date=None, end_date=None, daily_limit=14)),
+    "heatmap": ("get_vehicle_heatmap", "get_heatmap_for_vehicle", dict(grid_size_m=100.0)),
+}
+
+
+def _call_vehicle_route(monkeypatch, ovms_db, name, uid):
+    route, data_fn, kwargs = _VEHICLE_ROUTES[name]
+    monkeypatch.setattr(crud, data_fn, _reached)
+    return getattr(api, route)("car1", db=None, ovms_db=ovms_db, current_user=_user(uid), **kwargs)
+
+
+@pytest.mark.parametrize("name", sorted(_VEHICLE_ROUTES))
+def test_owner_reaches_the_vehicles_trips(monkeypatch, ovms_db, name):
+    with pytest.raises(_Reached):
+        _call_vehicle_route(monkeypatch, ovms_db, name, OWNER)
+
+
+@pytest.mark.parametrize("uid", [ADMIN, STRANGER])
+@pytest.mark.parametrize("name", sorted(_VEHICLE_ROUTES))
+def test_admin_and_stranger_are_refused_the_vehicles_trips(monkeypatch, ovms_db, name, uid):
+    with pytest.raises(HTTPException) as refused:
+        _call_vehicle_route(monkeypatch, ovms_db, name, uid)
+    assert refused.value.status_code == 403
+
+
+def _karto_db_with_trip(**fields):
+    trip = SimpleNamespace(
+        id=TRIP_ID, vehicle_id="CAR1", status="completed",
+        start_time=datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc),
+        map_preview_path=None, map_preview_path_light=None, **fields,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = trip
+    return db, trip
+
+
+_TRIP_ROUTES = {
+    "detail": ("get_trip_details", "get_trip_with_points", dict(simplify_tolerance=None)),
+    "delete": ("delete_trip", "delete_trip", {}),
+    "gpx": ("get_trip_gpx", "get_trip_points_for_export", {}),
+    "kml": ("get_trip_kml", "get_trip_points_for_export", {}),
+}
+
+
+def _call_trip_route(monkeypatch, ovms_db, name, uid):
+    route, data_fn, kwargs = _TRIP_ROUTES[name]
+    monkeypatch.setattr(crud, data_fn, _reached)
+    db, _ = _karto_db_with_trip()
+    return getattr(api, route)(TRIP_ID, db=db, ovms_db=ovms_db, current_user=_user(uid), **kwargs)
+
+
+@pytest.mark.parametrize("name", sorted(_TRIP_ROUTES))
+def test_owner_reaches_the_trip(monkeypatch, ovms_db, name):
+    with pytest.raises(_Reached):
+        _call_trip_route(monkeypatch, ovms_db, name, OWNER)
+
+
+@pytest.mark.parametrize("uid", [ADMIN, STRANGER])
+@pytest.mark.parametrize("name", sorted(_TRIP_ROUTES))
+def test_admin_and_stranger_do_not_see_the_trip(monkeypatch, ovms_db, name, uid):
+    """The same 404 as for a trip that does not exist — no admin exception, no oracle."""
+    with pytest.raises(HTTPException) as refused:
+        _call_trip_route(monkeypatch, ovms_db, name, uid)
+    assert (refused.value.status_code, refused.value.detail) == (404, "trip_not_found")
+
+
+def _serve_map(monkeypatch, tmp_path, ovms_db, uid):
+    from app.config import settings
+
+    filename = f"CAR1_{TRIP_ID}.png"
+    (tmp_path / filename).write_bytes(b"png")
+    monkeypatch.setattr(settings, "MAPS_STORAGE_PATH", tmp_path)
+    _, trip = _karto_db_with_trip()
+    monkeypatch.setattr(crud, "get_trip_by_map_filename", lambda db, name: trip)
+    return api.get_map_image(filename, db=None, ovms_db=ovms_db, current_user=_user(uid))
+
+
+def test_owner_gets_the_map_image(monkeypatch, tmp_path, ovms_db):
+    from fastapi.responses import FileResponse
+
+    assert isinstance(_serve_map(monkeypatch, tmp_path, ovms_db, OWNER), FileResponse)
+
+
+@pytest.mark.parametrize("uid", [ADMIN, STRANGER])
+def test_admin_and_stranger_do_not_get_the_map_image(monkeypatch, tmp_path, ovms_db, uid):
+    with pytest.raises(HTTPException) as refused:
+        _serve_map(monkeypatch, tmp_path, ovms_db, uid)
+    assert refused.value.status_code == 404
+
+
+def test_search_finds_nothing_of_another_users_vehicle_for_an_admin(ovms_db):
+    """The search scopes by owner_id in its own query; it never had the bypass. Pinned."""
+    assert crud.search_trips(None, ovms_db, user_id=ADMIN, vehicle_id="CAR1",
+                             lat=49.0, lon=8.0, radius_m=100.0) == ([], 0)
+
+
+def _bulk_delete(monkeypatch, ovms_db, uid, api_key=None):
+    deleted = []
+    monkeypatch.setattr(
+        crud, "delete_all_trips_for_vehicle",
+        lambda db, vehicle_id, include_in_progress: deleted.append(vehicle_id) or 0,
+    )
+    request = SimpleNamespace(state=SimpleNamespace(api_key=api_key))
+    response = asyncio.run(api.delete_all_trips_for_vehicle(
+        request, "car1", include_in_progress=True, db=None, ovms_db=ovms_db, current_user=_user(uid)
+    ))
+    return response, deleted
+
+
+@pytest.mark.parametrize("uid, api_key", [(OWNER, None), (ADMIN, _deletion_key(ADMIN))],
+                         ids=["owner-cookie", "admin-deletion-key"])
+def test_owner_and_admin_can_bulk_delete_a_vehicles_trips(monkeypatch, ovms_db, uid, api_key):
+    """
+    The main server deletes a vehicle's trips — vehicle deletion, account deletion,
+    lifecycle housekeeping — with an internal key of the acting user, often an admin.
+    """
+    response, deleted = _bulk_delete(monkeypatch, ovms_db, uid, api_key)
+    assert response.status_code == 204
+    assert deleted == ["CAR1"]
+
+
+@pytest.mark.parametrize("uid, api_key", [
+    (ADMIN, None), (ADMIN, _personal_key(ADMIN)),
+    (INACTIVE_ADMIN, _deletion_key(INACTIVE_ADMIN)), (STRANGER, _deletion_key(STRANGER)),
+], ids=["admin-cookie", "admin-personal-key", "inactive-admin", "stranger"])
+def test_bulk_delete_is_refused_to_anyone_else(monkeypatch, ovms_db, uid, api_key):
+    with pytest.raises(HTTPException) as refused:
+        _bulk_delete(monkeypatch, ovms_db, uid, api_key)
+    assert refused.value.status_code == 403
+
+
+def test_only_the_bulk_delete_uses_the_administrative_check():
+    """
+    check_vehicle_administration() admits admins. Any other route calling it would bring
+    back the read access this change took away.
+    """
+    callers = [
+        name for name, fn in inspect.getmembers(api, inspect.isfunction)
+        if fn.__module__ == api.__name__ and "check_vehicle_administration(" in _code_only(fn)
+    ]
+    assert callers == ["delete_all_trips_for_vehicle"]
+    assert "check_vehicle_administration(" not in _code_only(crud.resolve_owned_trip)
+
+
+@pytest.mark.parametrize("key_name, expected_status", [
+    (None, 204),            # the main server's deletion key for CAR1
+    ("my laptop", 403),     # the same admin's personal key
+])
+def test_bulk_delete_sees_the_key_the_request_authenticated_with(
+        monkeypatch, ovms_db, key_name, expected_status):
+    """
+    Through the real get_current_user: the key row has to reach the route, or every
+    admin deletion by the main server is refused (and vehicle deletion stalls).
+    """
+    import asyncio
+    import hashlib
+
+    from app import security
+
+    key = _deletion_key(ADMIN)
+    if key_name is not None:
+        key.name = key_name
+    key.hashed_key = hashlib.sha256(b"secret-key").hexdigest()
+    ovms_db.add(key)
+    ovms_db.commit()
+
+    monkeypatch.setattr(security.ban_manager, "is_banned", lambda db, ip: False)
+    monkeypatch.setattr(security.failure_tracker, "clear_failures", lambda db, ip: None)
+    request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), state=SimpleNamespace(), cookies={})
+
+    user = asyncio.run(security.get_current_user(request, api_key="secret-key", ovms_db=ovms_db, karto_db=None))
+    assert user.id == ADMIN
+
+    monkeypatch.setattr(crud, "delete_all_trips_for_vehicle", lambda db, vehicle_id, include_in_progress: 0)
+    try:
+        response = asyncio.run(api.delete_all_trips_for_vehicle(
+            request, "car1", include_in_progress=True, db=None, ovms_db=ovms_db, current_user=user))
+        status_code = response.status_code
+    except HTTPException as refused:
+        status_code = refused.status_code
+    assert status_code == expected_status

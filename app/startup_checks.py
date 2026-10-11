@@ -5,8 +5,7 @@ Karto validates the OVMS main server's session cookies itself, using the *same*
 symmetric SECRET_KEY_JWT. That makes the secret's quality a Karto problem too: with the
 placeholder value from .env-template, anyone can mint
 `{"sub": "<any-user>", "mfa": true, "ver": 0, "exp": <future>}`, set it as a cookie and
-read (or delete) every user's trip history — and with an admin's username, the admin
-bypass in crud.check_vehicle_ownership hands over every vehicle in the system.
+read (or delete) every user's trip history.
 
 The main server refuses to start on placeholder secrets (app/bootstrap.py) and
 generates them on first run. Karto had neither check, and the gap is easy to miss in

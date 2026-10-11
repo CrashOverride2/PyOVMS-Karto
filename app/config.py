@@ -44,6 +44,9 @@ class Settings(BaseSettings):
 
     KARTO_TRIP_MIN_DISTANCE_KM: float = 1.0
 
+    # Hourly deletion of the trips of vehicle ids the OVMS server no longer registers.
+    KARTO_ORPHAN_SWEEP_ENABLED: bool = True
+
     KARTO_GPSLOG_BACKDATE_MAX_SECONDS: int = 3600
     KARTO_GPSLOG_COMPLETED_ATTACH_SLACK_SECONDS: int = 900
     KARTO_GPSLOG_DEDUPE_SECONDS: float = 4.0

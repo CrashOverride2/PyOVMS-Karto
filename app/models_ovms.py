@@ -37,6 +37,9 @@ class ApiKey(OvmsBase):
     id = Column(Integer, primary_key=True)
     hashed_key = Column(String(128), nullable=False, unique=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    # name and created_at identify the main server's internal deletion keys.
+    name = Column(String(100), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=True)
     user = relationship("User", back_populates="api_keys")

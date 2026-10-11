@@ -7,7 +7,7 @@ from alembic.config import Config as AlembicConfig
 from alembic import command as alembic_command
 
 from .mqtt_subscriber import mqtt_subscriber
-from .reaper import trip_reaper_task
+from .reaper import orphan_sweep_task, trip_reaper_task
 from .trip_tracker import trip_tracker_service
 from .config import settings
 from . import database
@@ -74,6 +74,9 @@ async def lifespan(app):
 
     refresh_task = asyncio.create_task(mqtt_subscription_refresh_task())
     background_tasks.add(refresh_task)
+
+    sweep_task = asyncio.create_task(orphan_sweep_task())
+    background_tasks.add(sweep_task)
 
     yield
 

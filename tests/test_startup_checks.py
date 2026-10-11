@@ -8,8 +8,9 @@ as-is accepted tokens anyone could mint:
 
     {"sub": "<any username>", "mfa": true, "ver": 0, "exp": <future>}
 
-With an admin's username that also unlocks the admin bypass in
-crud.check_vehicle_ownership: every vehicle's trip history, including deletion. It goes
+With an admin's username that also unlocked the admin bypass that crud.check_vehicle_ownership
+had then: every vehicle's trip history, including deletion (today an admin token reads and deletes
+nothing but the admin's own trips). It goes
 unnoticed in practice because API-key auth keeps working; only the cookie path breaks,
 and that is rarely exercised during setup.
 
