@@ -538,11 +538,11 @@ def test_no_one_holds_an_unknown_vehicle(ovms_db):
 
 
 _VEHICLE_ROUTES = {
-    "list": ("get_trips_for_vehicle", "get_trips_for_vehicle", dict(page=1, limit=5)),
+    "list": ("get_trips_for_vehicle", "get_trips_for_vehicle", {"page": 1, "limit": 5}),
     "current": ("get_current_trip", "get_current_trip_for_vehicle", {}),
     "stats": ("get_trip_statistics", "get_trip_statistics",
-              dict(start_date=None, end_date=None, daily_limit=14)),
-    "heatmap": ("get_vehicle_heatmap", "get_heatmap_for_vehicle", dict(grid_size_m=100.0)),
+              {"start_date": None, "end_date": None, "daily_limit": 14}),
+    "heatmap": ("get_vehicle_heatmap", "get_heatmap_for_vehicle", {"grid_size_m": 100.0}),
 }
 
 
@@ -578,7 +578,7 @@ def _karto_db_with_trip(**fields):
 
 
 _TRIP_ROUTES = {
-    "detail": ("get_trip_details", "get_trip_with_points", dict(simplify_tolerance=None)),
+    "detail": ("get_trip_details", "get_trip_with_points", {"simplify_tolerance": None}),
     "delete": ("delete_trip", "delete_trip", {}),
     "gpx": ("get_trip_gpx", "get_trip_points_for_export", {}),
     "kml": ("get_trip_kml", "get_trip_points_for_export", {}),
