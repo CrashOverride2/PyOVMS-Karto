@@ -15,7 +15,7 @@ from sqlalchemy import and_, func, null, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import aggregate_order_by, insert
 
-from . import models_ovms
+from . import models_ovms, trip_energy
 from .timestamps import as_utc
 from .config import settings
 from .models import GPSPoint, Trip, MapRegenerationQueue
@@ -170,10 +170,15 @@ def set_trip_start_energy(db: Session, trip_id: UUID, start_energy_kwh: float) -
     db.query(Trip).filter(Trip.id == trip_id, Trip.status == 'in_progress').update(
         {"start_energy_kwh": start_energy_kwh}, synchronize_session=False)
 
-def update_trip_on_completion(db: Session, trip: Trip, end_time: datetime, end_soc: Optional[float], end_point: GPSPoint, energy_used_kwh: Optional[float] = None, battery_capacity_kwh: Optional[float] = None) -> bool:
+def update_trip_on_completion(db: Session, trip: Trip, end_time: datetime, end_soc: Optional[float], end_point: GPSPoint,
+                              energy_used_kwh: Optional[float] = None, energy_estimate_kwh: Optional[float] = None) -> bool:
     """
     Finalizes a trip. If the trip is too short, it is deleted.
     Returns True if the trip was valid and completed, False if it was deleted.
+
+    `energy_used_kwh` is the difference of the vehicle's energy counter, `energy_estimate_kwh`
+    the SoC-based figure for when the counter gives none (see app/trip_energy.py). Either is
+    only kept when the trip's distance and duration allow for it.
     """
     trip.end_time = end_time
     trip.end_soc = end_soc
@@ -185,10 +190,6 @@ def update_trip_on_completion(db: Session, trip: Trip, end_time: datetime, end_s
     if trip.start_soc is not None and end_soc is not None:
         trip.soc_used = trip.start_soc - end_soc
 
-    trip.energy_used_kwh = energy_used_kwh
-    if trip.energy_used_kwh is None and battery_capacity_kwh is not None and trip.soc_used is not None and trip.soc_used > 0:
-        trip.energy_used_kwh = round((trip.soc_used / 100.0) * battery_capacity_kwh, 3)
-
     distance_km = track_length_km(db, trip.id)
     if distance_km is None:
         distance_km = 0.0
@@ -197,6 +198,17 @@ def update_trip_on_completion(db: Session, trip: Trip, end_time: datetime, end_s
         trip.average_speed_kph = (distance_km / trip.duration_seconds) * 3600
 
     trip.distance_km = distance_km
+
+    energy = trip_energy.plausible_energy_kwh(energy_used_kwh, distance_km, trip.duration_seconds)
+    if energy is None and energy_used_kwh is not None:
+        logger.warning(
+            f"Trip {trip.id} of vehicle {trip.vehicle_id}: energy counter difference {energy_used_kwh:.2f} kWh "
+            f"is not what {distance_km:.1f} km in {trip.duration_seconds or 0}s can use "
+            f"({max(trip_energy.energy_floor_kwh(distance_km), 0):.2f}–"
+            f"{trip_energy.energy_limit_kwh(distance_km, trip.duration_seconds):.1f} kWh) — discarding it.")
+    if energy is None:
+        energy = trip_energy.plausible_energy_kwh(energy_estimate_kwh, distance_km, trip.duration_seconds)
+    trip.energy_used_kwh = energy
     
     if trip.distance_km < settings.KARTO_TRIP_MIN_DISTANCE_KM:
         logger.info(f"Discarding short trip {trip.id} ({trip.distance_km:.2f} km) for vehicle {trip.vehicle_id}.")

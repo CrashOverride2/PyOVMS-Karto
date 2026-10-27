@@ -15,6 +15,9 @@ end grace period did the same to a ride that was already over. What is pinned he
   continued by a new ride that starts too long after it;
 - an adopted trip without a stored energy baseline reports no energy rather than a
   wrong one;
+- a counter difference reaches the completion whatever v.b.capacity says, and the SoC
+  estimate follows what v.b.capacity was learned to be (usable capacity or energy left),
+  none while that is unknown (see also test_trip_energy);
 - the grace period runs beside the MQTT workers, not in them;
 - the reaper finalizes instead of deleting, through the vehicle's state;
 - a point for a trip that was finalized meanwhile does not extend it;
@@ -36,7 +39,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -60,6 +63,7 @@ class Store:
         self.trips = {}
         self.points = {}  # trip id -> [(ts, lat, lon, speed)]
         self.completed = []  # (trip id, end_soc, energy)
+        self.estimates = {}  # trip id -> SoC-based energy estimate handed to the completion
         self.start_energy_writes = []
 
     def open_trip(self, start, lat, lon, start_energy=None, points=None):
@@ -113,10 +117,11 @@ def store(monkeypatch):
         s.points.setdefault(trip_id, []).append((ts, lat, lon, speed))
         return SimpleNamespace(timestamp=ts, location=wkt)
 
-    def complete(db, trip, end_time, end_soc, end_point, energy, battery_capacity_kwh=None):
+    def complete(db, trip, end_time, end_soc, end_point, energy, energy_estimate_kwh=None):
         trip.status = "completed"
         trip.end_time = end_time
         s.completed.append((trip.id, end_soc, energy))
+        s.estimates[trip.id] = energy_estimate_kwh
         return True
 
     def set_start_energy(db, trip_id, value):
@@ -545,6 +550,60 @@ async def test_live_view_reports_the_phase_of_the_tracked_trip(store):
     # A trip this run does not track has nothing live to report.
     assert tracker.live_view(VEHICLE, str(uuid4())) == {
         "phase": None, "current_soc": None, "energy_used_kwh": None}
+
+
+# ---------------------------------------------------------------------------
+# v.b.capacity: the usable capacity or the energy left, depending on the integration
+# ---------------------------------------------------------------------------
+
+
+async def _ride(tracker, end_metrics):
+    """A ride from the state's current SoC; `end_metrics` arrive just before v.e.on=0.
+    Returns the trip's id."""
+    lat, lon = 49.30, 8.40
+    await feed(tracker, [("v.e.on", "1")])
+    await drive_pass(tracker, T0, lat, lon)
+    trip_id = UUID(tracker._vehicle_states[VEHICLE].current_trip_id)
+    await drive_pass(tracker, T0 + timedelta(seconds=60), lat + 2000 * M, lon)
+    await feed(tracker, end_metrics + [("v.e.on", "0")])
+    await ended(tracker)
+    return trip_id
+
+
+@pytest.mark.asyncio
+async def test_a_counter_difference_above_the_energy_left_reaches_the_completion(store):
+    """A Zoe Ph2: 4.1 kWh used, 3.1 kWh left — no reason to drop the 4.1."""
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.b.soc", "13"), ("v.b.capacity", "7.2"), ("v.b.energy.used", "78.0")])
+    trip_id = await _ride(tracker, [("v.b.soc", "4"), ("v.b.capacity", "3.1"), ("v.b.energy.used", "82.1")])
+    assert store.completed == [(trip_id, 4.0, pytest.approx(4.1))]
+
+
+@pytest.mark.asyncio
+async def test_capacity_falling_with_the_soc_is_estimated_by_its_drop(store):
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.b.soc", "90"), ("v.b.capacity", "45.0"), ("v.b.soc", "70"), ("v.b.capacity", "35.0")])
+    assert tracker._vehicle_states[VEHICLE].capacity_kind == "remaining"
+    trip_id = await _ride(tracker, [("v.b.soc", "60"), ("v.b.capacity", "30.0")])
+    # 5 kWh the battery gave, not 10 % of the 30 kWh it has left.
+    assert store.estimates[trip_id] == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_capacity_that_stays_put_is_estimated_from_the_soc(store):
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.b.soc", "90"), ("v.b.capacity", "52.0"), ("v.b.soc", "70"), ("v.b.capacity", "52.0")])
+    assert tracker._vehicle_states[VEHICLE].capacity_kind == "total"
+    trip_id = await _ride(tracker, [("v.b.soc", "60")])
+    assert store.estimates[trip_id] == pytest.approx(5.2)
+
+
+@pytest.mark.asyncio
+async def test_capacity_of_unknown_meaning_gives_no_estimate(store):
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.b.soc", "70"), ("v.b.capacity", "35.0")])
+    trip_id = await _ride(tracker, [("v.b.soc", "60")])
+    assert store.estimates[trip_id] is None
 
 
 # ---------------------------------------------------------------------------

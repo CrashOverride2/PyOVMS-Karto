@@ -10,7 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from . import crud, gpx_generator, kml_generator
+from . import crud, gpx_generator, kml_generator, trip_energy
 from .api_models import (OpenTrip, PaginatedTripSummary, PaginationDetails, TripDetail,
                          TripStatistics, HeatmapPoint, PaginatedTripSearchSummary)
 from .config import settings
@@ -94,7 +94,7 @@ def get_trips_for_vehicle(
     - `distance_km` / `distance_miles` — total trip distance
     - `average_speed_kph` / `average_speed_mph` — average moving speed
     - `soc_used` — battery State-of-Charge consumed (percentage points)
-    - `energy_used_kwh` — energy consumed in kWh (from MQTT or derived from SoC + capacity)
+    - `energy_used_kwh` — energy consumed in kWh: the vehicle's energy counter, else estimated from SoC and battery energy; null when neither is known
     - `consumption_kwh_per_100km` / `consumption_kwh_per_100mi` — average energy efficiency
     - `start_soc` / `end_soc` — battery level at trip boundaries
     """
@@ -163,6 +163,7 @@ def get_current_trip(
     average = (distance_km / duration * 3600) if distance_km is not None and duration > 0 else None
     start = crud.get_start_position(trip)
     live = trip_tracker_service.live_view(vehicle_id_upper, str(trip.id))
+    energy = trip_energy.plausible_energy_kwh(live["energy_used_kwh"], distance_km, duration)
 
     return OpenTrip(
         id=trip.id,
@@ -181,7 +182,7 @@ def get_current_trip(
         average_speed_kph=round(average, 1) if average is not None else None,
         phase=live["phase"],
         current_soc=live["current_soc"],
-        energy_used_kwh=round(live["energy_used_kwh"], 3) if live["energy_used_kwh"] is not None else None,
+        energy_used_kwh=round(energy, 3) if energy is not None else None,
     )
 
 @router.get("/vehicles/{vehicle_id}/stats", response_model=TripStatistics)

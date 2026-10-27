@@ -9,7 +9,7 @@ from geopy.distance import great_circle
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
-from . import crud
+from . import crud, trip_energy
 from .config import settings
 from . import database
 from .map_generator import generate_trip_map
@@ -197,7 +197,18 @@ class VehicleState(BaseModel):
     # the counter read now covers more than the trip, and a baseline taken now covers
     # less. See _energy_delta().
     energy_baseline_unknown: bool = False
+    # The last v.b.capacity reading. What it means depends on the integration — usable
+    # capacity, or the energy left — so it is only used once capacity_kind says which,
+    # see app/trip_energy.py.
     latest_battery_capacity_kwh: Optional[float] = None
+    # trip_energy.CAPACITY_TOTAL / CAPACITY_REMAINING once two readings far enough apart
+    # in SoC told; kept until a later pair says otherwise (a firmware update can change it).
+    capacity_kind: Optional[str] = None
+    # (SoC, kWh) of the reading the next one is compared with, see _observe_capacity().
+    capacity_reference: Optional[Tuple[float, float]] = None
+    # v.b.capacity when the trip started. Not taken later: for the energy left, a reading
+    # from the middle of the trip would make its drop cover only the rest of it.
+    trip_start_capacity_kwh: Optional[float] = None
 
     pending_lat: Optional[float] = None
     pending_lon: Optional[float] = None
@@ -441,6 +452,7 @@ class TripTrackerService:
             db.commit()
             state.current_trip_id = str(new_trip.id)
             state.trip_start_energy_kwh = state.latest_energy_kwh
+            state.trip_start_capacity_kwh = state.latest_battery_capacity_kwh
             state.last_saved_gps_point = GPSPointInternal(lat=point.lat, lon=point.lon, speed_kph=point.speed_kph,
                                                          altitude_m=point.altitude_m, timestamp=ts)
             logger.info(f"TRIP STARTED: Vehicle {vehicle_id} started trip {new_trip.id} from a buffered GPS log record at {ts.isoformat()}.")
@@ -619,10 +631,41 @@ class TripTrackerService:
         async with lock:
             state = await self._get_or_create_state(vehicle_id)
             try:
-                state.latest_battery_capacity_kwh = float(payload)
-                logger.debug(f"Vehicle {vehicle_id}: battery capacity update {state.latest_battery_capacity_kwh:.1f} kWh")
+                capacity = float(payload)
             except (ValueError, TypeError):
                 logger.warning(f"Could not parse battery capacity value '{payload}' for {vehicle_id}")
+                return
+            if capacity <= 0:
+                logger.debug(f"Vehicle {vehicle_id}: ignoring battery capacity {capacity}")
+                return
+            state.latest_battery_capacity_kwh = capacity
+            logger.debug(f"Vehicle {vehicle_id}: battery capacity update {capacity:.1f} kWh")
+            self._observe_capacity(vehicle_id, state)
+
+    @staticmethod
+    def _observe_capacity(vehicle_id: str, state: VehicleState) -> None:
+        """
+        Learns what the vehicle's v.b.capacity is from the reading just received and the
+        SoC of the moment, against the reading kept as reference. Only on a capacity
+        reading: the energy left is polled by some integrations every few minutes, and
+        paired with a newer SoC a stale value would look like a capacity that stays put.
+        """
+        if state.latest_soc is None:
+            return
+        pair = (state.latest_soc, state.latest_battery_capacity_kwh)
+        if state.capacity_reference is None:
+            state.capacity_reference = pair
+            return
+        ref_soc, ref_kwh = state.capacity_reference
+        if abs(pair[0] - ref_soc) < trip_energy.CAPACITY_CLASSIFY_MIN_SOC_DELTA:
+            return
+        kind = trip_energy.classify_capacity(ref_soc, ref_kwh, *pair)
+        state.capacity_reference = pair
+        if kind is not None and kind != state.capacity_kind:
+            meaning = "usable capacity" if kind == trip_energy.CAPACITY_TOTAL else "energy left"
+            logger.info(f"Vehicle {vehicle_id}: v.b.capacity is the battery's {meaning} "
+                        f"({ref_kwh:.1f} kWh at {ref_soc:.0f} %, {pair[1]:.1f} kWh at {pair[0]:.0f} %).")
+            state.capacity_kind = kind
 
     async def handle_driving_state_change(self, vehicle_id: str, is_driving: bool):
         lock = await self._get_vehicle_lock(vehicle_id)
@@ -869,6 +912,7 @@ class TripTrackerService:
         """
         state.current_trip_id = str(trip.id)
         state.trip_start_energy_kwh = trip.start_energy_kwh
+        state.trip_start_capacity_kwh = None
         state.energy_baseline_unknown = trip.start_energy_kwh is None
         state.inherited_trip_last_seen = None
         state.last_saved_gps_point = None
@@ -882,12 +926,15 @@ class TripTrackerService:
         state.current_trip_id = None
         state.last_saved_gps_point = None
         state.trip_start_energy_kwh = None
+        state.trip_start_capacity_kwh = None
         state.energy_baseline_unknown = False
         state.inherited_trip_last_seen = None
 
     @staticmethod
     def _energy_delta(vehicle_id: str, state: VehicleState) -> Optional[float]:
-        """Energy used over the current trip, from the vehicle's energy counter."""
+        """Energy used over the current trip, from the vehicle's energy counter. Not checked
+        for plausibility here: that needs the trip's distance and duration, see
+        trip_energy.plausible_energy_kwh()."""
         if state.energy_baseline_unknown:
             # A trip taken over without a stored baseline. The fallback below would read
             # the whole session counter as its consumption, which is only right for a trip
@@ -908,14 +955,6 @@ class TripTrackerService:
                     # Counter was reset mid-trip (e.g. session-based counter); use end value directly
                     energy_delta = state.latest_energy_kwh
                     logger.debug(f"Vehicle {vehicle_id}: energy counter reset detected (start={state.trip_start_energy_kwh:.3f}, end={state.latest_energy_kwh:.3f}), using end value")
-        if energy_delta is not None and state.latest_battery_capacity_kwh is not None:
-            if energy_delta > state.latest_battery_capacity_kwh:
-                logger.warning(
-                    f"Vehicle {vehicle_id}: energy_delta={energy_delta:.1f} kWh exceeds battery "
-                    f"capacity {state.latest_battery_capacity_kwh:.1f} kWh — discarding (stale counter). "
-                    f"trip_start={state.trip_start_energy_kwh}, latest={state.latest_energy_kwh}"
-                )
-                energy_delta = None
         return energy_delta
 
     def _finalize_trip(self, db, vehicle_id: str, trip, state: Optional[VehicleState],
@@ -954,11 +993,15 @@ class TripTrackerService:
         readings = state if with_readings else None
         end_soc = readings.latest_soc if readings is not None else None
         energy_delta = self._energy_delta(vehicle_id, readings) if readings is not None else None
-        capacity = readings.latest_battery_capacity_kwh if readings is not None else None
-        logger.debug(f"Vehicle {vehicle_id}: final energy_delta={energy_delta}, battery_capacity={capacity}")
+        energy_estimate = None
+        if readings is not None and trip.start_soc is not None and end_soc is not None:
+            energy_estimate = trip_energy.soc_estimate_kwh(
+                readings.capacity_kind, trip.start_soc - end_soc, end_soc,
+                readings.trip_start_capacity_kwh, readings.latest_battery_capacity_kwh)
+        logger.debug(f"Vehicle {vehicle_id}: final energy_delta={energy_delta}, SoC-based estimate={energy_estimate}")
 
         is_trip_valid = crud.update_trip_on_completion(db, trip, end_point.timestamp, end_soc, end_point,
-                                                       energy_delta, battery_capacity_kwh=capacity)
+                                                       energy_delta, energy_estimate_kwh=energy_estimate)
         if is_trip_valid:
             trip_id = trip.id
             task = asyncio.create_task(generate_trip_map(trip_id))
@@ -1225,6 +1268,7 @@ class TripTrackerService:
                     db.commit()
                     state.current_trip_id = str(trip.id)
                     state.trip_start_energy_kwh = state.latest_energy_kwh
+                    state.trip_start_capacity_kwh = state.latest_battery_capacity_kwh
                     state.last_saved_gps_point = current_gps_point
                     logger.debug(f"TRIP STARTED: Vehicle {vehicle_id} started new trip {trip.id}.")
                     return
