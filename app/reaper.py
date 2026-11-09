@@ -72,7 +72,7 @@ def _find_unregistered_vehicle_ids() -> list[str]:
     limit = max(ORPHAN_SWEEP_MIN_ALLOWED, int(len(vehicle_ids) * ORPHAN_SWEEP_MAX_SHARE))
     if len(orphans) > limit:
         logger.error(
-            f"Orphan sweep: {len(orphans)} of {len(vehicle_ids)} vehicle ids with trips are not "
+            f"Orphan sweep: {len(orphans)} of {len(vehicle_ids)} vehicle ids with trips or a capacity row are not "
             f"registered on the OVMS server (limit {limit}); that looks like the wrong database, "
             f"not deleted vehicles. Nothing deleted. Check OVMS_DATABASE_URL, or delete the trips "
             f"by hand if the vehicles really are gone: {', '.join(orphans[:20])}"

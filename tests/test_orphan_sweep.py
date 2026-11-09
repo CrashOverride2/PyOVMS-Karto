@@ -141,3 +141,45 @@ def test_the_registration_lookup_is_case_blind_and_chunked(monkeypatch):
     wanted = [f"car{i}" for i in range(10)]
     assert crud.get_registered_vehicle_ids(db, wanted) == {f"CAR{i}" for i in range(7)}
     assert crud.count_registered_vehicles(db) == 7
+
+
+def test_a_capacity_row_without_trips_is_swept_and_a_registered_one_kept(monkeypatch):
+    """A vehicle deleted without trips must not keep its vehicle_capacity_kinds row."""
+    from sqlalchemy.pool import StaticPool
+
+    from app.models import VehicleCapacityKind
+
+    engine = create_engine("sqlite://", poolclass=StaticPool,
+                           connect_args={"check_same_thread": False})  # the sweep runs in to_thread
+    VehicleCapacityKind.__table__.create(engine)
+    with engine.begin() as conn:  # trips uses PostGIS types; the columns the sweep reads
+        conn.exec_driver_sql("CREATE TABLE trips (id CHAR(32) PRIMARY KEY, vehicle_id VARCHAR(32), "
+                             "status VARCHAR(20), map_preview_path VARCHAR(255), "
+                             "map_preview_path_light VARCHAR(255))")
+    karto = sessionmaker(bind=engine)
+    with karto() as db:
+        db.add_all([VehicleCapacityKind(vehicle_id=vid, capacity_kind="total", reference_soc=80.0,
+                                        reference_kwh=52.0) for vid in ("GONE", "CAR1", "CAR2")])
+        db.commit()
+        assert sorted(crud.get_trip_vehicle_ids(db)) == ["CAR1", "CAR2", "GONE"]
+
+    ovms_engine = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
+    models_ovms.OvmsBase.metadata.create_all(ovms_engine)
+    ovms = sessionmaker(bind=ovms_engine)
+    with ovms() as db:
+        db.add(models_ovms.User(id=1, username="u", hashed_password="x", is_admin=False, is_active=True))
+        db.add_all([models_ovms.Vehicle(vehicle_id=vid, owner_id=1) for vid in ("CAR1", "CAR2")])
+        db.commit()
+
+    monkeypatch.setattr(settings, "KARTO_ORPHAN_SWEEP_ENABLED", True)
+    monkeypatch.setattr(database, "SessionLocal", karto)
+    monkeypatch.setattr(database, "OvmsSessionLocal", ovms)
+
+    async def purge(vehicle_id, delete):
+        return delete()
+
+    monkeypatch.setattr(reaper.trip_tracker_service, "purge_vehicle", purge)
+
+    assert _sweep() == 0  # no trips went, only the row
+    with karto() as db:
+        assert sorted(r.vehicle_id for r in db.query(VehicleCapacityKind)) == ["CAR1", "CAR2"]

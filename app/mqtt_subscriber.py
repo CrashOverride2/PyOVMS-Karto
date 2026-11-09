@@ -218,6 +218,9 @@ class MqttSubscriber:
                 metric_name = ".".join(parts[4:])
                 coro = trip_tracker_service.process_message(vehicle_id, metric_name, payload)
             elif len(parts) >= 8 and parts[3] == 'notify' and parts[4] == 'data':
+                # A retained record is a replay, not a delivery; retained metrics stay wanted.
+                if msg.retain:
+                    return
                 # ovms/<owner>/<vehicle>/notify/data/<subtype...>/<msg_id>/<-age_seconds>
                 # The last segment is the record age (published as a negative offset), used
                 # for record formats that carry no timestamp of their own.

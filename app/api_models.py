@@ -57,7 +57,7 @@ class TripSummary(BaseModel):
     class Config:
         from_attributes = True
 class TripDetail(TripSummary):
-    geojson: Optional[Any] = Field(None, description="A GeoJSON LineString object representing the trip track.")
+    geojson: Optional[Any] = Field(None, description="A GeoJSON LineString object representing the trip track. A running trip with a single point has a line of zero length on it; null when there is no track.")
 
     class Config:
         from_attributes = True

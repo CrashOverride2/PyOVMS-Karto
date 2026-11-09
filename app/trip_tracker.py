@@ -203,11 +203,15 @@ class VehicleState(BaseModel):
     latest_battery_capacity_kwh: Optional[float] = None
     # trip_energy.CAPACITY_TOTAL / CAPACITY_REMAINING once two readings far enough apart
     # in SoC told; kept until a later pair says otherwise (a firmware update can change it).
+    # Persisted with the reference in vehicle_capacity_kinds.
     capacity_kind: Optional[str] = None
     # (SoC, kWh) of the reading the next one is compared with, see _observe_capacity().
     capacity_reference: Optional[Tuple[float, float]] = None
+    # Whether that row has been read into the two fields above.
+    capacity_restored: bool = False
     # v.b.capacity when the trip started. Not taken later: for the energy left, a reading
-    # from the middle of the trip would make its drop cover only the rest of it.
+    # from the middle of the trip would make its drop cover only the rest of it. None for
+    # a trip that starts before this run heard the reading.
     trip_start_capacity_kwh: Optional[float] = None
 
     pending_lat: Optional[float] = None
@@ -452,7 +456,8 @@ class TripTrackerService:
             db.commit()
             state.current_trip_id = str(new_trip.id)
             state.trip_start_energy_kwh = state.latest_energy_kwh
-            state.trip_start_capacity_kwh = state.latest_battery_capacity_kwh
+            # The trip starts in the past; the completion falls back to the SoC estimate.
+            state.trip_start_capacity_kwh = None
             state.last_saved_gps_point = GPSPointInternal(lat=point.lat, lon=point.lon, speed_kph=point.speed_kph,
                                                          altitude_m=point.altitude_m, timestamp=ts)
             logger.info(f"TRIP STARTED: Vehicle {vehicle_id} started trip {new_trip.id} from a buffered GPS log record at {ts.isoformat()}.")
@@ -533,6 +538,9 @@ class TripTrackerService:
             if point.soc is not None:
                 trip.start_soc = point.soc
             db.commit()
+            if str(trip.id) == state.current_trip_id:
+                # Taken when the live flow opened the trip, which now starts earlier.
+                state.trip_start_capacity_kwh = None
             logger.info(f"Vehicle {vehicle_id}: trip {trip.id} start backdated to {ts.isoformat()} from a buffered GPS log record.")
         else:
             logger.info(f"Vehicle {vehicle_id}: GPS log record at {ts.isoformat()} predates trip {trip.id} start too far, dropped.")
@@ -640,25 +648,76 @@ class TripTrackerService:
                 return
             state.latest_battery_capacity_kwh = capacity
             logger.debug(f"Vehicle {vehicle_id}: battery capacity update {capacity:.1f} kWh")
-            self._observe_capacity(vehicle_id, state)
+            self._restore_capacity_kind(vehicle_id, state)
+            if self._observe_capacity(vehicle_id, state):
+                self._store_capacity_kind(vehicle_id, state)
 
     @staticmethod
-    def _observe_capacity(vehicle_id: str, state: VehicleState) -> None:
+    def _restore_capacity_kind(vehicle_id: str, state: VehicleState) -> None:
+        """Reads what an earlier run learned about v.b.capacity, once per state; memory wins."""
+        if state.capacity_restored:
+            return
+        db = database.SessionLocal()
+        try:
+            row = crud.get_capacity_kind(db, vehicle_id)
+        except Exception as e:
+            logger.warning(f"Vehicle {vehicle_id}: could not read what its v.b.capacity is: {e}")
+            return
+        finally:
+            db.close()
+        state.capacity_restored = True
+        if row is None:
+            return
+        if state.capacity_kind is None and row.capacity_kind in (trip_energy.CAPACITY_TOTAL,
+                                                                 trip_energy.CAPACITY_REMAINING):
+            state.capacity_kind = row.capacity_kind
+        if state.capacity_reference is None and isinstance(row.reference_soc, (int, float)) \
+                and isinstance(row.reference_kwh, (int, float)):
+            state.capacity_reference = (float(row.reference_soc), float(row.reference_kwh))
+
+    @staticmethod
+    def _store_capacity_kind(vehicle_id: str, state: VehicleState) -> None:
+        """Writes the row unless the vehicle is no longer registered with trip tracking."""
+        try:
+            ovms_db = database.OvmsSessionLocal()
+            try:
+                allowed = crud.is_trip_tracking_enabled(ovms_db, vehicle_id)
+            finally:
+                ovms_db.close()
+        except Exception as e:
+            logger.warning(f"Vehicle {vehicle_id}: could not check the registration before storing "
+                           f"what its v.b.capacity is: {e}")
+            allowed = True
+        if not allowed:
+            return
+        ref_soc, ref_kwh = state.capacity_reference or (None, None)
+        db = database.SessionLocal()
+        try:
+            crud.store_capacity_kind(db, vehicle_id, state.capacity_kind, ref_soc, ref_kwh)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"Vehicle {vehicle_id}: could not store what its v.b.capacity is: {e}")
+        finally:
+            db.close()
+
+    @staticmethod
+    def _observe_capacity(vehicle_id: str, state: VehicleState) -> bool:
         """
         Learns what the vehicle's v.b.capacity is from the reading just received and the
-        SoC of the moment, against the reading kept as reference. Only on a capacity
-        reading: the energy left is polled by some integrations every few minutes, and
-        paired with a newer SoC a stale value would look like a capacity that stays put.
+        SoC of the moment, against the reading kept as reference. Returns whether the
+        reference or the kind changed. Only on a capacity reading: a stale value paired
+        with a newer SoC would look like a capacity that stays put.
         """
         if state.latest_soc is None:
-            return
+            return False
         pair = (state.latest_soc, state.latest_battery_capacity_kwh)
         if state.capacity_reference is None:
             state.capacity_reference = pair
-            return
+            return True
         ref_soc, ref_kwh = state.capacity_reference
         if abs(pair[0] - ref_soc) < trip_energy.CAPACITY_CLASSIFY_MIN_SOC_DELTA:
-            return
+            return False
         kind = trip_energy.classify_capacity(ref_soc, ref_kwh, *pair)
         state.capacity_reference = pair
         if kind is not None and kind != state.capacity_kind:
@@ -666,6 +725,7 @@ class TripTrackerService:
             logger.info(f"Vehicle {vehicle_id}: v.b.capacity is the battery's {meaning} "
                         f"({ref_kwh:.1f} kWh at {ref_soc:.0f} %, {pair[1]:.1f} kWh at {pair[0]:.0f} %).")
             state.capacity_kind = kind
+        return True
 
     async def handle_driving_state_change(self, vehicle_id: str, is_driving: bool):
         lock = await self._get_vehicle_lock(vehicle_id)
@@ -938,8 +998,8 @@ class TripTrackerService:
         if state.energy_baseline_unknown:
             # A trip taken over without a stored baseline. The fallback below would read
             # the whole session counter as its consumption, which is only right for a trip
-            # this run saw start; unknown is honest, and the completion can still derive a
-            # figure from the SoC.
+            # this run saw start; unknown is honest, and the completion can still estimate
+            # one from the SoC.
             return None
         energy_delta = None
         if state.latest_energy_kwh is not None:

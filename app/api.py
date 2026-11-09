@@ -374,6 +374,8 @@ def get_trip_details(
     ensuring the authenticated user has permission.
     An optional `simplify_tolerance` can be provided to reduce the number of
     points in the returned GeoJSON track.
+
+    A running trip with a single point has a zero-length track on that point.
     """
     _authorize_trip(db, ovms_db, trip_id, current_user.id)
     trip = crud.get_trip_with_points(db, trip_id=trip_id, simplify_tolerance=simplify_tolerance)

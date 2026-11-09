@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import aggregate_order_by, insert
 from . import models_ovms, trip_energy
 from .timestamps import as_utc
 from .config import settings
-from .models import GPSPoint, Trip, MapRegenerationQueue
+from .models import GPSPoint, Trip, MapRegenerationQueue, VehicleCapacityKind
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,23 @@ def set_trip_start_energy(db: Session, trip_id: UUID, start_energy_kwh: float) -
     db.query(Trip).filter(Trip.id == trip_id, Trip.status == 'in_progress').update(
         {"start_energy_kwh": start_energy_kwh}, synchronize_session=False)
 
+def get_capacity_kind(db: Session, vehicle_id: str) -> Optional[VehicleCapacityKind]:
+    """What the vehicle's v.b.capacity was learned to be, see app/trip_energy.py."""
+    return db.get(VehicleCapacityKind, vehicle_id)
+
+def store_capacity_kind(db: Session, vehicle_id: str, capacity_kind: Optional[str],
+                        reference_soc: Optional[float], reference_kwh: Optional[float]) -> None:
+    """Upserts the learned v.b.capacity kind; None never replaces a stored kind. The caller commits."""
+    stmt = insert(VehicleCapacityKind).values(vehicle_id=vehicle_id, capacity_kind=capacity_kind,
+                                              reference_soc=reference_soc, reference_kwh=reference_kwh)
+    stmt = stmt.on_conflict_do_update(index_elements=['vehicle_id'], set_={
+        "capacity_kind": func.coalesce(stmt.excluded.capacity_kind, VehicleCapacityKind.capacity_kind),
+        "reference_soc": stmt.excluded.reference_soc,
+        "reference_kwh": stmt.excluded.reference_kwh,
+        "updated_at": func.now(),
+    })
+    db.execute(stmt)
+
 def update_trip_on_completion(db: Session, trip: Trip, end_time: datetime, end_soc: Optional[float], end_point: GPSPoint,
                               energy_used_kwh: Optional[float] = None, energy_estimate_kwh: Optional[float] = None) -> bool:
     """
@@ -275,15 +292,19 @@ def get_trip_with_points(db: Session, trip_id: UUID, simplify_tolerance: Optiona
         return None
     
     point_count = db.query(GPSPoint).filter(GPSPoint.trip_id == trip.id).count()
-    if point_count < 2:
+    if point_count == 1 and trip.status == 'in_progress':
+        # A zero-length line, so clients can frame a trip that has not moved yet.
+        point = GPSPoint.location.cast(Geometry)
+        line_geom = func.ST_MakeLine(point, point)
+    elif point_count < 2:
         trip.geojson = None
         return trip
+    else:
+        # The order goes inside the aggregate, as in track_length_km(): an ORDER BY on a
+        # subquery feeding ST_MakeLine is not something SQL promises to keep.
+        line_geom = func.ST_MakeLine(aggregate_order_by(GPSPoint.location.cast(Geometry), GPSPoint.timestamp))
 
-    # The order goes inside the aggregate, as in track_length_km(): an ORDER BY on a
-    # subquery feeding ST_MakeLine is not something SQL promises to keep.
-    line_geom = func.ST_MakeLine(aggregate_order_by(GPSPoint.location.cast(Geometry), GPSPoint.timestamp))
-
-    if simplify_tolerance and simplify_tolerance > 0:
+    if simplify_tolerance and simplify_tolerance > 0 and point_count > 1:
         line_geom = ST_Simplify(line_geom, simplify_tolerance)
 
     geojson_result = db.query(ST_AsGeoJSON(line_geom)).filter(GPSPoint.trip_id == trip.id).first()
@@ -344,11 +365,17 @@ def delete_all_trips_for_vehicle(db: Session, vehicle_id: str, include_in_progre
     selected = [Trip.vehicle_id == vehicle_id]
     if not include_in_progress:
         selected.append(Trip.status != 'in_progress')
+    else:
+        # The id may be registered next for another car.
+        db.query(VehicleCapacityKind).filter(
+            VehicleCapacityKind.vehicle_id == vehicle_id
+        ).delete(synchronize_session=False)
 
     trips = db.query(
         Trip.id, Trip.map_preview_path, Trip.map_preview_path_light
     ).filter(*selected).all()
     if not trips:
+        db.commit()
         return 0
 
     trip_ids = [row[0] for row in trips]
@@ -769,8 +796,9 @@ def get_vehicle_registration(db: Session, vehicle_id: str):
 
 
 def get_trip_vehicle_ids(db: Session) -> List[str]:
-    """Every vehicle id Karto holds at least one trip for."""
-    return [row[0] for row in db.query(Trip.vehicle_id).distinct().all()]
+    """Every vehicle id Karto holds data for: a trip or a vehicle_capacity_kinds row."""
+    ids = db.query(Trip.vehicle_id).union(db.query(VehicleCapacityKind.vehicle_id)).all()
+    return [row[0] for row in ids]
 
 
 # Bound parameters per IN (...): SQLite's limit is 999 on older builds.

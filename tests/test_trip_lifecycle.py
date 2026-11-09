@@ -17,7 +17,9 @@ end grace period did the same to a ride that was already over. What is pinned he
   wrong one;
 - a counter difference reaches the completion whatever v.b.capacity says, and the SoC
   estimate follows what v.b.capacity was learned to be (usable capacity or energy left),
-  none while that is unknown (see also test_trip_energy);
+  none while that is unknown (see also test_trip_energy); what was learned, and the
+  reference reading, survive a restart, and a trip whose start lies before the gap a
+  buffered record closed takes no start capacity from after it;
 - the grace period runs beside the MQTT workers, not in them;
 - the reaper finalizes instead of deleting, through the vehicle's state;
 - a point for a trip that was finalized meanwhile does not extend it;
@@ -65,6 +67,7 @@ class Store:
         self.completed = []  # (trip id, end_soc, energy)
         self.estimates = {}  # trip id -> SoC-based energy estimate handed to the completion
         self.start_energy_writes = []
+        self.capacity_kinds = {}  # vehicle id -> the vehicle_capacity_kinds row
 
     def open_trip(self, start, lat, lon, start_energy=None, points=None):
         trip = SimpleNamespace(id=uuid4(), vehicle_id=VEHICLE, status="in_progress",
@@ -144,6 +147,9 @@ def store(monkeypatch):
     monkeypatch.setattr(crud, "add_gps_point", add_gps_point)
     monkeypatch.setattr(crud, "update_trip_on_completion", complete)
     monkeypatch.setattr(crud, "set_trip_start_energy", set_start_energy)
+    monkeypatch.setattr(crud, "get_capacity_kind", lambda db, vid: s.capacity_kinds.get(vid))
+    monkeypatch.setattr(crud, "store_capacity_kind", lambda db, vid, kind, ref_soc, ref_kwh: s.capacity_kinds.__setitem__(
+        vid, SimpleNamespace(capacity_kind=kind, reference_soc=ref_soc, reference_kwh=ref_kwh)))
     monkeypatch.setattr(crud, "find_timed_out_trips", lambda db, timeout: s.open_trips())
     monkeypatch.setattr(trip_tracker, "generate_trip_map", no_map)
 
@@ -606,6 +612,97 @@ async def test_capacity_of_unknown_meaning_gives_no_estimate(store):
     assert store.estimates[trip_id] is None
 
 
+@pytest.mark.asyncio
+async def test_what_v_b_capacity_is_survives_a_restart(store):
+    """
+    A usable capacity is a constant, and a module publishes a metric only when it
+    changes: after a restart the retained reading is often the only one for weeks. In
+    memory only, the kind was gone with the restart and so was every trip's estimate.
+    """
+    before = TripTrackerService()
+    await feed(before, [("v.b.soc", "90"), ("v.b.capacity", "52.0"), ("v.b.soc", "70"), ("v.b.capacity", "52.0")])
+    assert before._vehicle_states[VEHICLE].capacity_kind == "total"
+
+    tracker = TripTrackerService()
+    # The retained burst: the same reading, at the same SoC — it tells nothing by itself.
+    await feed(tracker, [("v.b.soc", "70"), ("v.b.capacity", "52.0")])
+    assert tracker._vehicle_states[VEHICLE].capacity_kind == "total"
+    trip_id = await _ride(tracker, [("v.b.soc", "60")])
+    assert store.estimates[trip_id] == pytest.approx(5.2)
+
+
+@pytest.mark.asyncio
+async def test_the_reference_reading_survives_a_restart(store):
+    """One reading before the restart and one after are a pair, as within one run."""
+    before = TripTrackerService()
+    await feed(before, [("v.b.soc", "90"), ("v.b.capacity", "52.0")])
+    assert before._vehicle_states[VEHICLE].capacity_kind is None
+
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.b.soc", "70"), ("v.b.capacity", "52.0")])
+    assert tracker._vehicle_states[VEHICLE].capacity_kind == "total"
+    trip_id = await _ride(tracker, [("v.b.soc", "60")])
+    assert store.estimates[trip_id] == pytest.approx(5.2)
+
+
+@pytest.mark.asyncio
+async def test_no_capacity_row_for_a_vehicle_not_registered_with_trip_tracking(store, monkeypatch):
+    """Deleted on the main server, it stays subscribed until the next refresh; a reading
+    meanwhile must not recreate the row its deletion removed."""
+    monkeypatch.setattr(trip_tracker.crud, "is_trip_tracking_enabled", lambda db, vid: False)
+    tracker = TripTrackerService()
+    await feed(tracker, [("v.b.soc", "90"), ("v.b.capacity", "52.0"), ("v.b.soc", "70"), ("v.b.capacity", "52.0")])
+    assert tracker._vehicle_states[VEHICLE].capacity_kind == "total"
+    assert store.capacity_kinds == {}
+
+
+def xne(ts: datetime, lat: float, lon: float, soc: float) -> str:
+    """A NIU GT EVO GPS log record; it carries its own time and the SoC."""
+    return f"XNE-GPS-Log,{int(ts.timestamp())},86400,{lat:.6f},{lon:.6f},30,87,1.0,8,30,1234,{soc:.0f}"
+
+
+async def _energy_left_learned(tracker):
+    await feed(tracker, [("v.b.soc", "90"), ("v.b.capacity", "45.0"), ("v.b.soc", "70"), ("v.b.capacity", "35.0")])
+    assert tracker._vehicle_states[VEHICLE].capacity_kind == "remaining"
+
+
+@pytest.mark.asyncio
+async def test_a_trip_started_from_a_buffered_record_does_not_use_the_capacity_after_the_gap(store):
+    """
+    The ride began in a dead zone at 70 %; the records arrive once it is over, at 60 %
+    and 30 kWh left. The drop from those 30 kWh covers only the ride after the gap.
+    """
+    now = datetime.now(timezone.utc)
+    tracker = TripTrackerService()
+    await _energy_left_learned(tracker)
+    await feed(tracker, [("v.e.on", "1"), ("v.b.soc", "60"), ("v.b.capacity", "30.0")])
+    await feed_log(tracker, 0, xne(now - timedelta(minutes=10), 49.30, 8.40, soc=70), received_at=now)
+    trip_id = UUID(tracker._vehicle_states[VEHICLE].current_trip_id)
+    assert store.trips[trip_id].start_soc == 70.0
+
+    await feed(tracker, [("v.b.soc", "50"), ("v.b.capacity", "25.0"), ("v.e.on", "0")])
+    await ended(tracker)
+    # 20 points at 0.5 kWh each; the drop since the gap would say 5.
+    assert store.estimates[trip_id] == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_a_trip_start_backdated_by_a_buffered_record_drops_the_later_capacity(store):
+    now = datetime.now(timezone.utc)
+    tracker = TripTrackerService()
+    await _energy_left_learned(tracker)
+    await feed(tracker, [("v.e.on", "1"), ("v.b.soc", "60"), ("v.b.capacity", "30.0")])
+    await drive_pass(tracker, now - timedelta(minutes=2), 49.30, 8.40)
+    trip_id = UUID(tracker._vehicle_states[VEHICLE].current_trip_id)
+    # The module's records of the start, in a dead zone before the live flow saw it.
+    await feed_log(tracker, 0, xne(now - timedelta(minutes=10), 49.30 - 3000 * M, 8.40, soc=70), received_at=now)
+    assert store.trips[trip_id].start_soc == 70.0
+
+    await feed(tracker, [("v.b.soc", "50"), ("v.b.capacity", "25.0"), ("v.e.on", "0")])
+    await ended(tracker)
+    assert store.estimates[trip_id] == pytest.approx(10.0)
+
+
 # ---------------------------------------------------------------------------
 # Buffered GPS log records and an open trip this run does not track
 # ---------------------------------------------------------------------------
@@ -872,6 +969,28 @@ def test_the_trip_geometry_is_ordered_inside_the_aggregate(captured_queries):
     assert "(SELECT" not in sql, "the order is back in a subquery"
 
 
+@pytest.mark.parametrize("status, has_track", [("in_progress", True), ("completed", False)])
+def test_a_running_trip_of_one_point_has_a_track_on_it(captured_queries, monkeypatch,
+                                                        status, has_track):
+    """A trip just started has one point; without a track clients framed half of Europe."""
+    from sqlalchemy.orm import Query
+    from app import crud
+
+    monkeypatch.setattr(Query, "count", lambda self: 1)
+    line = '{"type":"LineString","coordinates":[[8.42,49.35],[8.42,49.35]]}'
+    captured_queries.results = [SimpleNamespace(id=uuid4(), status=status), (line,)]
+    trip = crud.get_trip_with_points(captured_queries.session, uuid4(), simplify_tolerance=0.001)
+    if not has_track:
+        assert trip.geojson is None
+        return
+    assert trip.geojson == line
+    sql = _pg(captured_queries.first[-1])
+    assert ("ST_MakeLine(CAST(gps_points.location AS geometry(GEOMETRY,-1)), "
+            "CAST(gps_points.location AS geometry(GEOMETRY,-1)))") in sql
+    # Simplifying a line of zero length collapses it to NULL.
+    assert "ST_Simplify" not in sql
+
+
 @pytest.mark.parametrize("include_in_progress, keeps_running", [(False, True), (True, False)])
 def test_the_bulk_delete_keeps_the_running_trip_unless_asked(captured_queries, monkeypatch,
                                                              include_in_progress, keeps_running):
@@ -883,6 +1002,33 @@ def test_the_bulk_delete_keeps_the_running_trip_unless_asked(captured_queries, m
     trips_delete = _pg(captured_queries.deleted[-1])
     assert "FROM trips" in trips_delete
     assert ("trips.status != 'in_progress'" in trips_delete) is keeps_running
+
+
+@pytest.mark.parametrize("include_in_progress", [False, True])
+def test_only_deleting_the_vehicle_forgets_what_its_capacity_is(captured_queries, monkeypatch,
+                                                                include_in_progress):
+    """The id may be registered next for another car; the user's bulk delete keeps the car."""
+    from app import crud
+
+    monkeypatch.setattr(crud, "_remove_map_preview", lambda path: None)
+    crud.delete_all_trips_for_vehicle(captured_queries.session, VEHICLE,
+                                      include_in_progress=include_in_progress)
+    forgets = [sql for sql in map(_pg, captured_queries.deleted) if "FROM vehicle_capacity_kinds" in sql]
+    assert bool(forgets) is include_in_progress
+    if forgets:
+        assert f"vehicle_capacity_kinds.vehicle_id = '{VEHICLE}'" in forgets[0]
+
+
+def test_storing_a_reference_keeps_the_kind_already_stored(captured_queries, monkeypatch):
+    """A run whose read of the row failed knows no kind, only its new reference."""
+    from app import crud
+
+    executed = []
+    monkeypatch.setattr(captured_queries.session, "execute", executed.append)
+    crud.store_capacity_kind(captured_queries.session, VEHICLE, None, 70.0, 52.0)
+    sql = _pg(executed[0])
+    assert "ON CONFLICT (vehicle_id) DO UPDATE" in sql
+    assert "capacity_kind = coalesce(excluded.capacity_kind, vehicle_capacity_kinds.capacity_kind)" in sql
 
 
 def test_the_bulk_delete_route_keeps_the_running_trip_by_default(monkeypatch):

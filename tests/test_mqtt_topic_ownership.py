@@ -19,9 +19,10 @@ from app.mqtt_subscriber import MqttSubscriber
 
 
 class _Msg:
-    def __init__(self, topic: str, payload: bytes = b"1"):
+    def __init__(self, topic: str, payload: bytes = b"1", retain: bool = False):
         self.topic = topic
         self.payload = payload
+        self.retain = retain
 
 
 def _subscriber_with(pairs):
@@ -83,6 +84,19 @@ def test_data_notification_for_the_correct_owner_is_processed(monkeypatch):
     sub._on_message(None, None, _Msg("ovms/alice/ALICECAR/notify/data/XNE-GPS-Log/1/-30"))
 
     assert seen == [("data", "ALICECAR", 30)]
+
+
+def test_a_retained_data_notification_is_a_replay_and_ignored(monkeypatch):
+    """The broker replays retained records on every subscribe; an untimed GPS log is
+    dated from the receive time, so a replay would put an old position at "now"."""
+    sub = _subscriber_with([("alice", "ALICECAR")])
+    seen = _captured_dispatches(monkeypatch, sub)
+
+    sub._on_message(None, None, _Msg("ovms/alice/ALICECAR/notify/data/RT-GPS-Log/1/-30", retain=True))
+    sub._on_message(None, None, _Msg("ovms/alice/ALICECAR/metric/v/e/on", retain=True))
+
+    # The retained metric is still wanted: the trip state after a restart rests on it.
+    assert seen == [("metric", "ALICECAR", "v.e.on")]
 
 
 def test_unsubscribed_vehicle_is_dropped(monkeypatch):

@@ -54,6 +54,17 @@ class GPSPoint(Base):
     trip = relationship("Trip", back_populates="gps_points")
 
 
+class VehicleCapacityKind(Base):
+    """What a vehicle's v.b.capacity was learned to be (app/trip_energy.py), and the reference reading."""
+    __tablename__ = 'vehicle_capacity_kinds'
+    vehicle_id = Column(String(32), primary_key=True)
+    # trip_energy.CAPACITY_TOTAL / CAPACITY_REMAINING; NULL while only a reference is known.
+    capacity_kind = Column(String(16))
+    reference_soc = Column(Float)
+    reference_kwh = Column(Float)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
 class MapRegenerationQueue(Base):
     __tablename__ = 'map_regeneration_queue'
     trip_id = Column(Uuid, primary_key=True)
